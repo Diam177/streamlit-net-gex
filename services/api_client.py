@@ -1,132 +1,246 @@
 # services/api_client.py
+# -*- coding: utf-8 -*-
+"""
+Клиент RapidAPI Yahoo Finance 15.
+Нужны секреты (Streamlit Cloud → Settings → Secrets):
+  RAPIDAPI_HOST = "yahoo-finance15.p.rapidapi.com"
+  RAPIDAPI_KEY  = "<ваш ключ>"
+"""
+
+from __future__ import annotations
 import os
+import time
+import math
+import typing as T
 import requests
-from typing import Tuple, List, Dict, Any
 
-RAPIDAPI_HOST = os.getenv("RAPIDAPI_HOST", "yahoo-finance15.p.rapidapi.com")
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")
-
-BASE_URL = f"https://{RAPIDAPI_HOST}"
-
-
-def _headers() -> Dict[str, str]:
-    return {
-        "X-RapidAPI-Key": RAPIDAPI_KEY,
-        "X-RapidAPI-Host": RAPIDAPI_HOST,
-    }
+# ---- логгер: используем ваш utils.logger, если есть; иначе стандартный ----
+try:
+    from utils.logger import get_logger  # type: ignore
+    log = get_logger(__name__)
+except Exception:  # pragma: no cover
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    log = logging.getLogger(__name__)
 
 
-def _get(url: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    resp = requests.get(url, headers=_headers(), params=params or {}, timeout=30)
-    # Дадим больше дебага в логах Streamlit
+def _as_int(x, default: int = 0) -> int:
     try:
-        resp.raise_for_status()
-    except Exception as e:
-        raise RuntimeError(
-            f"HTTP error {resp.status_code} for {url} params={params}; body[:500]={resp.text[:500]}"
-        ) from e
+        if x is None:
+            return default
+        if isinstance(x, bool):
+            return int(x)
+        return int(float(x))
+    except Exception:
+        return default
+
+
+def _as_float(x, default: float = 0.0) -> float:
     try:
-        return resp.json()
-    except Exception as e:
-        raise RuntimeError(f"JSON parse error for {url}: {resp.text[:500]}") from e
+        if x is None or (isinstance(x, str) and x.strip() == ""):
+            return default
+        return float(x)
+    except Exception:
+        return default
 
 
-def get_option_overview(symbol: str, exp_ts: int | None = None) -> Dict[str, Any]:
+class RapidYahooClient:
     """
-    Универсальный вызов:
-    - без date -> получить список экспираций + первую цепочку
-    - с date   -> получить конкретную цепочку на дату
+    Минималистичный клиент под наши задачи:
+      - список дат экспирации
+      - чейн опционов на выбранную дату
+      - котировка базового актива (S)
     """
-    url = f"{BASE_URL}/api/yahoo/option/{symbol.upper()}"
-    params = {}
-    if exp_ts:
-        params["date"] = str(int(exp_ts))
-    return _get(url, params=params)
 
+    def __init__(
+        self,
+        host: str | None = None,
+        key: str | None = None,
+        session: requests.Session | None = None,
+        timeout: int = 30,
+    ) -> None:
+        self.host = (host or os.getenv("RAPIDAPI_HOST") or "").strip()
+        self.key = (key or os.getenv("RAPIDAPI_KEY") or "").strip()
+        if not self.host or not self.key:
+            raise RuntimeError(
+                "RAPIDAPI_HOST / RAPIDAPI_KEY не заданы (проверьте Secrets)."
+            )
 
-def _extract_expirations(payload: Dict[str, Any]) -> List[int]:
-    """
-    Устойчиво выдёргиваем список экспираций из разных возможных схем:
-    1) { meta: { expirationDates: [...] }, options: [...] }
-    2) { optionChain: { result: [ { expirationDates: [...], options: [...] } ] } }
-    3) { expirationDates: [...] }
-    """
-    exps: List[int] = []
+        # На RapidAPI «host» и «base_url» разделены:
+        self.base_url = f"https://{self.host}"
+        self.timeout = timeout
+        self.s = session or requests.Session()
+        self.headers = {
+            "x-rapidapi-host": self.host,
+            "x-rapidapi-key": self.key,
+        }
 
-    if not isinstance(payload, dict):
-        return exps
+    # ------------------------ низкоуровневый вызов -------------------------
 
-    # Вариант 1
-    meta = payload.get("meta")
-    if isinstance(meta, dict) and "expirationDates" in meta:
-        exps = meta.get("expirationDates") or []
-
-    # Вариант 2
-    if not exps and "optionChain" in payload:
-        oc = payload.get("optionChain") or {}
-        res = oc.get("result") or []
-        if isinstance(res, list) and res:
-            r0 = res[0] or {}
-            if "expirationDates" in r0:
-                exps = r0.get("expirationDates") or []
-            if not exps and "options" in r0:
-                opts = r0.get("options") or []
-                # соберём expirationDate из options-массивов
-                pool = []
-                for o in opts:
-                    ed = o.get("expirationDate")
-                    if isinstance(ed, int):
-                        pool.append(ed)
-                exps = pool
-
-    # Вариант 3
-    if not exps and "expirationDates" in payload:
-        exps = payload.get("expirationDates") or []
-
-    # Нормализуем
-    out: List[int] = []
-    for x in exps:
+    def _get(self, path: str, params: dict | None = None) -> dict:
+        url = f"{self.base_url}{path}"
+        log.debug("GET %s params=%s", url, params)
+        r = self.s.get(url, headers=self.headers, params=params, timeout=self.timeout)
         try:
-            out.append(int(x))
+            r.raise_for_status()
+        except Exception as e:
+            # В лог выводим текст; вверх даём компактное исключение
+            log.exception("HTTP error: %s %s", url, getattr(r, "text", "")[:500])
+            raise RuntimeError(f"HTTP {r.status_code} for {path}") from e
+        try:
+            data = r.json()
+        except Exception as e:
+            log.exception("JSON decode error: %s", r.text[:500])
+            raise RuntimeError("Провайдер вернул не-JSON") from e
+
+        # RapidAPI иногда отдаёт 200 с сообщением об ошибке внутри JSON
+        if isinstance(data, dict) and data.get("message"):
+            msg = data.get("message")
+            log.error("API message: %s", msg)
+            raise RuntimeError(f"API message: {msg}")
+        return data
+
+    # --------------------------- публичные методы --------------------------
+
+    def get_expirations(self, symbol: str) -> list[int]:
+        """
+        Список дат экспирации (Unix timestamp, сек) для тикера.
+        """
+        data = self._get(f"/api/yahoo/v7/finance/options/{symbol}")
+        try:
+            return list(
+                map(
+                    int,
+                    data["optionChain"]["result"][0]["expirationDates"],
+                )
+            )
         except Exception:
-            continue
-    return sorted(set(out))
+            log.debug("expirations raw: %s", str(data)[:800])
+            return []
+
+    def get_option_chain_raw(self, symbol: str, date_ts: int) -> dict:
+        """
+        Сырой чейн опционов на дату date_ts.
+        """
+        return self._get(
+            f"/api/yahoo/v7/finance/options/{symbol}",
+            params={"date": int(date_ts)},
+        )
+
+    def get_quote_raw(self, symbol: str) -> dict:
+        """
+        Сырая котировка базового актива. Пробуем hiresquotes, при неудаче – /qu/quote.
+        """
+        try:
+            return self._get(f"/api/yahoo/hiresquotes/{symbol}")
+        except Exception:
+            return self._get(f"/api/yahoo/qu/quote/{symbol}")
+
+    # --------------------- функции нормализации под расчёты ----------------
+
+    @staticmethod
+    def _extract_price_from_chain(chain_raw: dict) -> tuple[float, int]:
+        """
+        Пытаемся достать цену S и метку времени t0 прямо из ответа по опционам.
+        Возвращаем (S, t0). Если не получилось – (0.0, now).
+        """
+        now = int(time.time())
+        try:
+            res0 = chain_raw["optionChain"]["result"][0]
+            q = res0.get("quote", {}) or {}
+            # разные эндпоинты/символы по-разному кладут цену
+            s_candidates = [
+                q.get("regularMarketPrice"),
+                q.get("regularMarketPreviousClose"),
+                q.get("postMarketPrice"),
+                q.get("preMarketPrice"),
+            ]
+            S = next((float(x) for x in s_candidates if x is not None), 0.0)
+            t0 = _as_int(q.get("regularMarketTime"), now)
+            return (S, t0 if t0 > 0 else now)
+        except Exception:
+            return (0.0, now)
+
+    @staticmethod
+    def _norm_option_list(lst: list[dict] | None, opt_type: str) -> list[dict]:
+        out: list[dict] = []
+        for x in lst or []:
+            out.append(
+                {
+                    "type": opt_type,  # "call" | "put"
+                    "contractSymbol": x.get("contractSymbol"),
+                    "strike": _as_float(x.get("strike")),
+                    "oi": _as_int(x.get("openInterest")),
+                    "volume": _as_int(x.get("volume")),
+                    # impliedVolatility у Yahoo хранится как доля (0.25 = 25%)
+                    "iv": _as_float(x.get("impliedVolatility")),
+                }
+            )
+        return out
+
+    def get_chain_normalized(
+        self, symbol: str, expiration_ts: int, need_quote_fallback: bool = True
+    ) -> dict:
+        """
+        Возвращает нормализованный объект:
+        {
+          "symbol": str,
+          "snapshot_ts": int,
+          "expiration_ts": int,
+          "price": float,     # S
+          "calls": [ {strike, oi, volume, iv, ...}, ... ],
+          "puts":  [ ... ]
+        }
+        """
+        raw = self.get_option_chain_raw(symbol, expiration_ts)
+        try:
+            res0 = raw["optionChain"]["result"][0]
+            options0 = res0["options"][0]
+        except Exception as e:
+            log.debug("chain raw head: %s", str(raw)[:800])
+            raise RuntimeError("Не удалось распарсить цепочку опционов") from e
+
+        S, t0 = self._extract_price_from_chain(raw)
+
+        # Если из чейна цену не вытащили — доберём из котировки
+        if S <= 0 and need_quote_fallback:
+            try:
+                qraw = self.get_quote_raw(symbol)
+                # hiresquotes → {"body":[{"regularMarketPrice":...}]}
+                if isinstance(qraw, dict) and "body" in qraw:
+                    body = qraw.get("body") or []
+                    if body:
+                        S = _as_float(body[0].get("regularMarketPrice"), 0.0)
+                        t0 = _as_int(body[0].get("regularMarketTime"), t0)
+                else:
+                    # /qu/quote/{symbol}
+                    S = (
+                        _as_float(qraw.get("regularMarketPrice"), 0.0)
+                        or _as_float(qraw.get("price", {}).get("regularMarketPrice", {}).get("raw"), 0.0)
+                    )
+                    t0 = _as_int(qraw.get("regularMarketTime"), t0)
+            except Exception:
+                log.warning("Не удалось получить котировку для %s", symbol)
+
+        calls = self._norm_option_list(options0.get("calls"), "call")
+        puts = self._norm_option_list(options0.get("puts"), "put")
+
+        return {
+            "symbol": symbol.upper(),
+            "snapshot_ts": int(t0),
+            "expiration_ts": int(expiration_ts),
+            "price": float(S),
+            "calls": calls,
+            "puts": puts,
+        }
+
+    # Удобный хелпер: ближайшая экспирация (если нужна в UI по умолчанию)
+    def get_nearest_expiration(self, symbol: str) -> int | None:
+        exps = self.get_expirations(symbol)
+        now_ts = int(time.time())
+        future = [e for e in exps if e >= now_ts - 3600]  # плюс небольшой допуск
+        return min(future) if future else (min(exps) if exps else None)
 
 
-def _extract_calls_puts(payload: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Возвращаем (calls, puts) из разных схем:
-    1) { options: [ { calls: [...], puts: [...] } ] }
-    2) { optionChain: { result: [ { options: [ { calls: [...], puts: [...] } ] } ] } }
-    """
-    # Схема 1
-    if "options" in payload:
-        opts = payload.get("options") or []
-        if isinstance(opts, list) and opts:
-            first = opts[0] or {}
-            return first.get("calls", []) or [], first.get("puts", []) or []
-
-    # Схема 2
-    if "optionChain" in payload:
-        oc = payload.get("optionChain") or {}
-        res = oc.get("result") or []
-        if isinstance(res, list) and res:
-            r0 = res[0] or {}
-            opts = r0.get("options") or []
-            if isinstance(opts, list) and opts:
-                first = opts[0] or {}
-                return first.get("calls", []) or [], first.get("puts", []) or []
-
-    return [], []
-
-
-def get_expiration_dates(symbol: str) -> Tuple[List[int], Dict[str, Any]]:
-    data = get_option_overview(symbol)
-    exps = _extract_expirations(data)
-    return exps, data
-
-
-def get_option_chain(symbol: str, exp_ts: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
-    data = get_option_overview(symbol, exp_ts=exp_ts)
-    calls, puts = _extract_calls_puts(data)
-    return calls, puts, data
+# Алиас на случай, если где-то использовалось другое имя
+RapidApiYahooClient = RapidYahooClient
