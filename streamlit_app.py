@@ -9,6 +9,7 @@ from logger import get_logger, get_log_file_path
 from services.api_client import get_option_chain
 from services.net_gex import calculate_net_gex
 from services.utils.debug import list_debug_files
+from netgex_chart import render_net_gex_bar_chart
 
 st.set_page_config(page_title="Net GEX — Streamlit", layout="wide")
 logger = get_logger("ui")
@@ -182,6 +183,12 @@ if st.button("Рассчитать", type="primary"):
         st.subheader("Итоговая таблица (провайдер + Net GEX)")
         st.dataframe(df_out.fillna(0), use_container_width=True)
 
+        st.markdown("---")
+        # Net GEX bar chart by strike
+        try:
+            render_net_gex_bar_chart(df_out, float(spot), ticker)
+        except Exception as _e:
+            logger.warning(f"Chart render skipped: {_e}")
         c1, c2, c3 = st.columns(3)
         with c1:
             st.download_button(
