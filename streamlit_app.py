@@ -169,7 +169,24 @@ if st.button("Рассчитать", type="primary"):
             k_classic = float(np.median(gS[valid]))
             if k_current > 0 and np.isfinite(k_current) and np.isfinite(k_classic) and k_classic > 0:
                 scale = k_classic / k_current
-                df_gex["NetGEX"] = pd.to_numeric(df_gex["NetGEX"], errors="coerce") * scale
+                # Use constant classic k applied to ΔOI to avoid underflow of provider NetGEX
+            try:
+                oi_col = "ΔOI" if "ΔOI" in df_gex.columns else ("dOI" if "dOI" in df_gex.columns else None)
+                if oi_col is not None:
+                    df_gex["NetGEX"] = pd.to_numeric(df_gex[oi_col], errors="coerce") * k_classic
+                else:
+                    # fallback: recompute ΔOI from raw and map by strike
+                    dmap = (
+                        pd.to_numeric(df_raw["call_OI"], errors="coerce").fillna(0)
+                        - pd.to_numeric(df_raw["put_OI"], errors="coerce").fillna(0)
+                    )
+                    if "strike" in df_raw.columns:
+                        tmp = pd.DataFrame({"strike": df_raw["strike"], "_d": dmap})
+                        df_gex = df_gex.merge(tmp, on="strike", how="left")
+                        df_gex["NetGEX"] = pd.to_numeric(df_gex["_d"], errors="coerce") * k_classic
+                        df_gex.drop(columns=["_d"], inplace=True, errors="ignore")
+            except Exception as _ex:
+                logger.warning(f"Classic-k override failed: {_ex}")
         # --- end calibration ---
 
 
