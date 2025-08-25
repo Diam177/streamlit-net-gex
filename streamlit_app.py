@@ -1,13 +1,14 @@
 import json
 import time
 import pandas as pd
+import math
 import streamlit as st
+import numpy as np
 
 from logger import get_logger, get_log_file_path
 from services.api_client import get_option_chain
 from services.net_gex import calculate_net_gex
 from services.utils.debug import list_debug_files
-from netgex_chart import render_net_gex_bar_chart
 
 st.set_page_config(page_title="Net GEX — Streamlit", layout="wide")
 logger = get_logger("ui")
@@ -100,6 +101,53 @@ if st.button("Рассчитать", type="primary"):
         )
         df_gex = result["table"]
 
+        # --- Classic k calibration (optional, aligns scale to Black–Scholes gamma*S*100) ---
+        S = float(spot)
+        T_years = max((int(expiry_ts) - int(snapshot_ts)) / 31536000.0, 1e-6)
+
+        iv_ser = pd.to_numeric(df_raw.get("iv"), errors="coerce")
+        try:
+            if float(iv_ser.median(skipna=True)) > 1.0:
+                iv_ser = iv_ser / 100.0
+        except Exception:
+            pass
+        iv_ser = iv_ser.clip(0.01, 3.0)
+
+        def _phi(x):
+            return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+        def _gamma_bs(Sval, K, Tval, sigma):
+            sigma = float(max(sigma, 1e-6))
+            Tval = float(max(Tval, 1e-6))
+            try:
+                d1 = (math.log(Sval / float(K)) + 0.5 * sigma * sigma * Tval) / (sigma * math.sqrt(Tval))
+            except Exception:
+                return 0.0
+            return _phi(d1) / (Sval * sigma * math.sqrt(Tval))
+
+        gamma_vals = [
+            _gamma_bs(S, float(k), T_years, float(s)) if pd.notna(s) and pd.notna(k) else 0.0
+            for k, s in zip(df_raw["strike"], iv_ser)
+        ]
+        gS = np.array(gamma_vals) * S * 100.0  # classic scale per strike
+
+        delta_oi = (
+            pd.to_numeric(df_raw["call_OI"], errors="coerce").fillna(0)
+            - pd.to_numeric(df_raw["put_OI"], errors="coerce").fillna(0)
+        )
+        netgex_series = df_gex.set_index("strike")["NetGEX"].reindex(df_raw["strike"])
+
+        mask = (delta_oi != 0) & netgex_series.notna() & np.isfinite(netgex_series.astype(float)) & np.isfinite(gS)
+        try:
+            k_current = float(np.median(np.abs(netgex_series[mask].astype(float)) / (np.abs(delta_oi[mask].astype(float)) + 1e-12)))
+            k_classic = float(np.median(gS[mask]))
+            if k_current > 0 and np.isfinite(k_current) and np.isfinite(k_classic) and k_classic > 0:
+                scale = k_classic / k_current
+                df_gex["NetGEX"] = pd.to_numeric(df_gex["NetGEX"], errors="coerce") * scale
+        except Exception:
+            pass
+        # --- end calibration ---
+
         st.subheader("Net GEX по страйкам")
         st.dataframe(df_gex, use_container_width=True)
 
@@ -108,9 +156,6 @@ if st.button("Рассчитать", type="primary"):
         st.subheader("Итоговая таблица (провайдер + Net GEX)")
         st.dataframe(df_out.fillna(0), use_container_width=True)
 
-        
-        st.markdown("---")
-        render_net_gex_bar_chart(df_out, float(spot), ticker)
         c1, c2, c3 = st.columns(3)
         with c1:
             st.download_button(
