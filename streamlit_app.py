@@ -88,7 +88,15 @@ if st.button("Рассчитать", type="primary"):
         } for p in puts])
 
         df_raw = pd.merge(df_calls, df_puts, on="strike", how="outer").sort_values("strike").reset_index(drop=True)
-        df_raw["iv"] = pd.concat([df_raw["call_iv"], df_raw["put_iv"]], axis=1).mean(axis=1, skipna=True)
+        if "iv" not in df_raw.columns or df_raw["iv"].isna().all():
+            df_raw["iv"] = pd.concat([df_raw["call_iv"], df_raw["put_iv"]], axis=1).mean(axis=1, skipna=True)
+        # convert percent IV to decimals if needed
+        try:
+            med_iv = float(pd.to_numeric(df_raw["iv"], errors="coerce").median(skipna=True))
+            if med_iv > 1.0:
+                df_raw["iv"] = pd.to_numeric(df_raw["iv"], errors="coerce") / 100.0
+        except Exception:
+            pass
 
         st.subheader("Сырые данные провайдера (нормализованные)")
         st.dataframe(df_raw.fillna(0), use_container_width=True)
@@ -125,28 +133,46 @@ if st.button("Рассчитать", type="primary"):
                 return 0.0
             return _phi(d1) / (Sval * sigma * math.sqrt(Tval))
 
-        gamma_vals = [
-            _gamma_bs(S, float(k), T_years, float(s)) if pd.notna(s) and pd.notna(k) else 0.0
-            for k, s in zip(df_raw["strike"], iv_ser)
-        ]
-        gS = np.array(gamma_vals) * S * 100.0  # classic scale per strike
-
-        delta_oi = (
-            pd.to_numeric(df_raw["call_OI"], errors="coerce").fillna(0)
-            - pd.to_numeric(df_raw["put_OI"], errors="coerce").fillna(0)
-        )
-        netgex_series = df_gex.set_index("strike")["NetGEX"].reindex(df_raw["strike"])
-
-        mask = (delta_oi != 0) & netgex_series.notna() & np.isfinite(netgex_series.astype(float)) & np.isfinite(gS)
+                # Build gamma*S*100 on aligned strikes
+        df_align = df_raw.merge(df_gex[["strike", "NetGEX"]], on="strike", how="inner")
+        iv_ser_align = pd.to_numeric(df_align.get("iv"), errors="coerce").clip(0.01, 3.0)
         try:
-            k_current = float(np.median(np.abs(netgex_series[mask].astype(float)) / (np.abs(delta_oi[mask].astype(float)) + 1e-12)))
-            k_classic = float(np.median(gS[mask]))
+            if float(iv_ser_align.median(skipna=True)) > 1.0:
+                iv_ser_align = iv_ser_align / 100.0
+        except Exception:
+            pass
+        def _phi(x):
+            return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+        def _gamma_bs(Sval, K, Tval, sigma):
+            sigma = float(max(sigma, 1e-6)); Tval = float(max(Tval, 1e-6))
+            try:
+                d1 = (math.log(Sval / float(K)) + 0.5 * sigma * sigma * Tval) / (sigma * math.sqrt(Tval))
+            except Exception:
+                return 0.0
+            return _phi(d1) / (Sval * sigma * math.sqrt(Tval))
+        gamma_vals = [
+            _gamma_bs(S, float(K), T_years, float(sig)) if pd.notna(sig) and pd.notna(K) else 0.0
+            for K, sig in zip(df_align["strike"], iv_ser_align)
+        ]
+        gS = np.array(gamma_vals) * S * 100.0
+        delta_oi = (
+            pd.to_numeric(df_align["call_OI"], errors="coerce").fillna(0)
+            - pd.to_numeric(df_align["put_OI"], errors="coerce").fillna(0)
+        )
+        netgex_series = pd.to_numeric(df_align["NetGEX"], errors="coerce")
+        valid = (
+            (delta_oi != 0)
+            & netgex_series.notna()
+            & np.isfinite(netgex_series)
+            & np.isfinite(gS)
+        )
+        if valid.any():
+            k_current = float(np.median(np.abs(netgex_series[valid]) / (np.abs(delta_oi[valid]) + 1e-12)))
+            k_classic = float(np.median(gS[valid]))
             if k_current > 0 and np.isfinite(k_current) and np.isfinite(k_classic) and k_classic > 0:
                 scale = k_classic / k_current
                 df_gex["NetGEX"] = pd.to_numeric(df_gex["NetGEX"], errors="coerce") * scale
-        except Exception:
-            pass
-        # --- end calibration ---
+# --- end calibration ---
 
         st.subheader("Net GEX по страйкам")
         st.dataframe(df_gex, use_container_width=True)
