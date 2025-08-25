@@ -109,9 +109,9 @@ if st.button("Рассчитать", type="primary"):
         st.dataframe(df_out.fillna(0), use_container_width=True)
 
         
-st.markdown("---")
-render_net_gex_bar_chart(df_out, float(spot), ticker)
-c1, c2, c3 = st.columns(3)
+        st.markdown("---")
+        render_net_gex_bar_chart(df_out, float(spot), ticker)
+        c1, c2, c3 = st.columns(3)
         with c1:
             st.download_button(
                 "Скачать итоговую таблицу (CSV)",
