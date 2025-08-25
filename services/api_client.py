@@ -4,7 +4,7 @@ import requests
 from typing import Any, Dict
 
 from logger import get_logger
-from services.utils.debug import dump_json, safe_redact
+from .utils.debug import dump_json, safe_redact
 
 logger = get_logger("api")
 
