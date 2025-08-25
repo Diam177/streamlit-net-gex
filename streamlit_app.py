@@ -102,10 +102,6 @@ if st.button("Рассчитать", type="primary"):
         st.subheader("Net GEX по страйкам")
         st.dataframe(df_gex, use_container_width=True)
 
-        except Exception as e:
-
-            logger.warning(f"Calibration step skipped: {e}")
-
         df_out = df_raw.merge(df_gex[["strike", "NetGEX"]], on="strike", how="left")
         df_out = df_out[["strike", "call_OI", "put_OI", "call_volume", "put_volume", "iv", "NetGEX"]]
         st.subheader("Итоговая таблица (провайдер + Net GEX)")
