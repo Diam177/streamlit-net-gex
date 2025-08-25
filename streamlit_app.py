@@ -136,93 +136,222 @@ if st.button("Рассчитать", type="primary"):
 
                 # Build gamma*S*100 on aligned strikes
         df_align = df_raw.merge(df_gex[["strike", "NetGEX"]], on="strike", how="inner")
+# ATM kernel: take 11 strikes closest to spot to avoid underflow at far OTM
+df_align = df_align.assign(_dist=(df_align["strike"].astype(float) - float(spot)).abs()).sort_values("_dist").head(11)
+iv_ser_align = pd.to_numeric(df_align.get("iv"), errors="coerce").clip(0.01, 3.0)
+try:
+    if float(iv_ser_align.median(skipna=True)) > 1.0:
+        iv_ser_align = iv_ser_align / 100.0
+except Exception:
+    pass
+def _phi(x):
+    return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+def _gamma_bs(Sval, K, Tval, sigma):
+    sigma = float(max(sigma, 1e-6)); Tval = float(max(Tval, 1e-6))
+    try:
+        d1 = (math.log(Sval / float(K)) + 0.5 * sigma * sigma * Tval) / (sigma * math.sqrt(Tval))
+    except Exception:
+        return 0.0
+    return _phi(d1) / (Sval * sigma * math.sqrt(Tval))
+gamma_vals = [
+    _gamma_bs(S, float(K), T_years, float(sig)) if pd.notna(sig) and pd.notna(K) else 0.0
+    for K, sig in zip(df_align["strike"], iv_ser_align)
+]
+gS = np.array(gamma_vals) * S * 100.0
+delta_oi = (
+    pd.to_numeric(df_align["call_OI"], errors="coerce").fillna(0)
+    - pd.to_numeric(df_align["put_OI"], errors="coerce").fillna(0)
+)
+netgex_series = pd.to_numeric(df_align["NetGEX"], errors="coerce")
+valid = (
+    (delta_oi != 0)
+    & netgex_series.notna()
+    & np.isfinite(netgex_series)
+    & np.isfinite(gS)
+)
+if valid.any():
+    k_current = float(np.median(np.abs(netgex_series[valid]) / (np.abs(delta_oi[valid]) + 1e-12)))
+    k_classic = float(np.median(gS[valid]))
+    if k_current > 0 and np.isfinite(k_current) and np.isfinite(k_classic) and k_classic > 0:
+        scale = k_classic / k_current
+        df_gex["NetGEX"] = pd.to_numeric(df_gex["NetGEX"], errors="coerce") * scale
+
         iv_ser_align = pd.to_numeric(df_align.get("iv"), errors="coerce").clip(0.01, 3.0)
+
         try:
+
             if float(iv_ser_align.median(skipna=True)) > 1.0:
+
                 iv_ser_align = iv_ser_align / 100.0
+
         except Exception:
+
             pass
+
         def _phi(x):
+
             return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
         def _gamma_bs(Sval, K, Tval, sigma):
+
             sigma = float(max(sigma, 1e-6)); Tval = float(max(Tval, 1e-6))
+
             try:
+
                 d1 = (math.log(Sval / float(K)) + 0.5 * sigma * sigma * Tval) / (sigma * math.sqrt(Tval))
+
             except Exception:
+
                 return 0.0
+
             return _phi(d1) / (Sval * sigma * math.sqrt(Tval))
+
         gamma_vals = [
+
             _gamma_bs(S, float(K), T_years, float(sig)) if pd.notna(sig) and pd.notna(K) else 0.0
+
             for K, sig in zip(df_align["strike"], iv_ser_align)
+
         ]
+
         gS = np.array(gamma_vals) * S * 100.0
+
         delta_oi = (
+
             pd.to_numeric(df_align["call_OI"], errors="coerce").fillna(0)
+
             - pd.to_numeric(df_align["put_OI"], errors="coerce").fillna(0)
+
         )
+
         netgex_series = pd.to_numeric(df_align["NetGEX"], errors="coerce")
+
         valid = (
+
             (delta_oi != 0)
+
             & netgex_series.notna()
+
             & np.isfinite(netgex_series)
+
             & np.isfinite(gS)
+
         )
+
         if valid.any():
+
             k_current = float(np.median(np.abs(netgex_series[valid]) / (np.abs(delta_oi[valid]) + 1e-12)))
+
             k_classic = float(np.median(gS[valid]))
+
             if k_current > 0 and np.isfinite(k_current) and np.isfinite(k_classic) and k_classic > 0:
+
                 scale = k_classic / k_current
+
                 df_gex["NetGEX"] = pd.to_numeric(df_gex["NetGEX"], errors="coerce") * scale
+
 # --- end calibration ---
 
+
+
         st.subheader("Net GEX по страйкам")
+
         st.dataframe(df_gex, use_container_width=True)
 
+
+
         df_out = df_raw.merge(df_gex[["strike", "NetGEX"]], on="strike", how="left")
+
         df_out = df_out[["strike", "call_OI", "put_OI", "call_volume", "put_volume", "iv", "NetGEX"]]
+
         st.subheader("Итоговая таблица (провайдер + Net GEX)")
+
         st.dataframe(df_out.fillna(0), use_container_width=True)
 
+
+
         st.markdown("---")
+
         # Net GEX bar chart by strike
+
         try:
+
             render_net_gex_bar_chart(df_out, float(spot), ticker)
+
         except Exception as _e:
+
             logger.warning(f"Chart render skipped: {_e}")
+
         c1, c2, c3 = st.columns(3)
+
         with c1:
+
             st.download_button(
+
                 "Скачать итоговую таблицу (CSV)",
+
                 data=df_out.to_csv(index=False).encode("utf-8"),
+
                 file_name=f"net_gex_{ticker}_{ts2str(expiry_ts)}.csv",
+
                 mime="text/csv",
+
             )
+
         with c2:
+
             st.download_button(
+
                 "Скачать сырые данные (JSON)",
+
                 data=json.dumps(df_raw.fillna(0).to_dict(orient="records"), ensure_ascii=False, indent=2),
+
                 file_name=f"raw_{ticker}_{ts2str(expiry_ts)}.json",
+
                 mime="application/json",
+
             )
+
         with c3:
+
             files = list_debug_files()
+
             if files:
+
                 last_file = files[0]
+
                 with open(last_file, "rb") as f:
+
                     st.download_button("Скачать последний debug-файл", data=f.read(), file_name=last_file.split('/')[-1])
+
             else:
+
                 st.caption("Нет debug-файлов")
 
+
+
     except Exception as e:
+
         logger.exception("Calculation failed")
+
         st.exception(e)
 
+
+
 st.divider()
+
 st.subheader("Debug / Logs")
+
 log_path = get_log_file_path()
+
 st.caption(f"Логи: {log_path}")
+
 try:
+
     with open(log_path, "rb") as f:
+
         st.download_button("Скачать лог-файл", data=f.read(), file_name="app.log")
+
 except FileNotFoundError:
+
     st.caption("Лог-файл пока не создан")
