@@ -23,6 +23,7 @@ def calculate_net_gex(df: pd.DataFrame, S: float, expiry_ts: int, snapshot_ts: i
     df["ΔOI"] = df["call_OI"] - df["put_OI"]
 
     T = max((expiry_ts - snapshot_ts) / 31_536_000, 1e-6)
+
     iv_series = df.get("iv", pd.Series([np.nan]*len(df)))
     iv_median = float(np.nanmedian(iv_series)) if np.isfinite(np.nanmedian(iv_series)) else 0.25
     df["iv_used"] = iv_series.fillna(iv_median).replace(0, iv_median)
@@ -45,9 +46,9 @@ def calculate_net_gex(df: pd.DataFrame, S: float, expiry_ts: int, snapshot_ts: i
     df["NetGEX"] = k_raw * df["ΔOI"]
     df_out = df[["strike", "call_OI", "put_OI", "ΔOI", "iv_used", "NetGEX"]].sort_values("strike").reset_index(drop=True)
 
-    # Debug snapshot
     dump_json("calc_snapshot", {
-        "S": S, "T_years": T, "iv_median": iv_median,
+        "S": S, "T_years": (expiry_ts - snapshot_ts)/31_536_000,
+        "T_used": T, "iv_median": iv_median,
         "gamma_avg": gamma_avg, "k_raw": k_raw,
         "rows": int(len(df_out))
     })
