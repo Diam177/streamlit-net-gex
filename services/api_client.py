@@ -4,176 +4,206 @@ from __future__ import annotations
 import os
 import time
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-log = logging.getLogger(__name__)
+LOG = logging.getLogger(__name__)
+LOG.setLevel(logging.INFO)
+
+DEFAULT_BASE = "https://{host}/api/v1/markets/options"
+ENV_HOST = "RAPIDAPI_HOST"
+ENV_KEY = "RAPIDAPI_KEY"
 
 
 class RapidYahooClient:
     """
-    Мини-клиент для Yahoo Finance 15 (RapidAPI).
-    Использует секреты/переменные окружения:
-      RAPIDAPI_HOST, RAPIDAPI_KEY
+    Клиент для yahoo-finance15.p.rapidapi.com (Yahoo Finance 15 на RapidAPI).
+
+    ВАЖНО: у этого провайдера узел с цепочкой опционов лежит под ключом-строкой
+    'chains[0]'. Поэтому обращаться нужно именно так: payload["chains[0]"].
     """
 
     def __init__(
         self,
         host: Optional[str] = None,
-        key: Optional[str] = None,
-        timeout: int = 20,
+        api_key: Optional[str] = None,
+        session: Optional[requests.Session] = None,
+        timeout: float = 25.0,
     ) -> None:
-        # host/ключ читаем из env или (в Streamlit Cloud) из st.secrets
-        host_env = host or os.getenv("RAPIDAPI_HOST")
-        key_env = key or os.getenv("RAPIDAPI_KEY")
-
-        # на всякий случай уберём лишние кавычки, если их ввели в Secrets
-        if host_env and host_env.startswith('"') and host_env.endswith('"'):
-            host_env = host_env[1:-1]
-        if key_env and key_env.startswith('"') and key_env.endswith('"'):
-            key_env = key_env[1:-1]
-
-        if not host_env or not key_env:
+        self.host = (host or os.getenv(ENV_HOST) or "").strip()
+        self.api_key = (api_key or os.getenv(ENV_KEY) or "").strip()
+        if not self.host or not self.api_key:
             raise RuntimeError(
-                "RAPIDAPI_HOST / RAPIDAPI_KEY не заданы. "
-                "Добавьте их в Secrets приложения."
+                f"RapidYahooClient: отсутствуют секреты {ENV_HOST} / {ENV_KEY}"
             )
 
-        self.base_url = f"https://{host_env.strip()}"
-        self.headers = {
-            "x-rapidapi-host": host_env.strip(),
-            "x-rapidapi-key": key_env.strip(),
-        }
+        self.base_url = DEFAULT_BASE.format(host=self.host)
+        self.session = session or requests.Session()
         self.timeout = timeout
 
-        log.debug("RapidYahooClient init: base_url=%s", self.base_url)
+    # ---------- HTTP ----------
 
-    # ---------------------------- internal helpers ----------------------------
+    def _headers(self) -> Dict[str, str]:
+        return {
+            "x-rapidapi-host": self.host,
+            "x-rapidapi-key": self.api_key,
+            "accept": "application/json",
+        }
 
-    def _req(self, method: str, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        t0 = time.time()
-        r = requests.request(method, url, headers=self.headers, params=params, timeout=self.timeout)
-        try:
-            r.raise_for_status()
-            data = r.json()
-        except Exception as e:
-            # логируем тело ответа для дебага
-            log.exception("HTTP error on %s %s params=%s status=%s text=%s",
-                          method, url, params, getattr(r, "status_code", None), getattr(r, "text", None))
-            raise
-
-        log.debug("HTTP %s %s %s -> %ss", method, url, params or "", round(time.time() - t0, 3))
+    def _get(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        LOG.info("GET %s params=%s", self.base_url, params)
+        r = self.session.get(self.base_url, params=params, headers=self._headers(), timeout=self.timeout)
+        if r.status_code != 200:
+            # Логируем укороченный ответ для дебага
+            txt = r.text
+            LOG.error("RapidAPI error %s: %s", r.status_code, txt[:1000])
+            raise RuntimeError(f"RapidAPI {r.status_code}: {txt[:200]}")
+        data = r.json()
+        LOG.info("OK: keys=%s", list(data.keys()))
         return data
 
-    def _try_paths(self, paths: list[str], params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """
-        Перебирает возможные пути API (у провайдера встречаются разные варианты).
-        Возвращает первый успешный JSON.
-        """
-        last_exc = None
-        for p in paths:
-            url = self.base_url + p
-            try:
-                return self._req("GET", url, params)
-            except Exception as e:
-                last_exc = e
-                log.debug("Path failed: %s (%s)", p, e)
-                continue
-        if last_exc:
-            raise last_exc
-        raise RuntimeError("No API path succeeded")
+    # ---------- Публичные методы, которые вызывает твой streamlit_app ----------
 
-    # ------------------------------ public API --------------------------------
-
-    def get_options_chain(self, symbol: str) -> Dict[str, Any]:
+    def get_expiration_dates(self, ticker: str) -> List[int]:
         """
-        Возвращает структуру optionChain для тикера:
-          - либо целиком raw payload провайдера,
-          - либо dict вида result[0] (как в Yahoo).
-        Этой структуры достаточно, чтобы вытащить expirationDates.
+        Возвращает список доступных дат экспирации (Unix seconds, UTC).
+        Провайдер отдаёт их в поле 'expirationDates'.
         """
-        # На RapidAPI встречаются разные пути к одной и той же ручке
-        paths = [
-            f"/api/yahoo/op/option/{symbol}",
-            f"/api/yahoo/options/{symbol}",
-            f"/api/yahoo/finance/options/{symbol}",
-        ]
-        payload = self._try_paths(paths)
+        payload = self._get({"ticker": ticker})
+        exps = payload.get("expirationDates") or []
+        if not isinstance(exps, list):
+            LOG.warning("Неожиданный формат expirationDates: %r", exps)
+            return []
+        return [int(x) for x in exps]
 
-        # normalize к формату Yahoo: optionChain.result[0]
-        if "optionChain" in payload and "result" in payload["optionChain"]:
-            # уже «классический» формат
-            return payload["optionChain"]["result"][0]
-        return payload  # пусть верхний слой сам разберётся
-
-    def get_options_for_expiry(self, symbol: str, expiration_unix: int) -> Dict[str, Any]:
+    def pick_nearest_expiration(self, expirations: List[int], t0: Optional[int] = None) -> Optional[int]:
         """
-        Возвращает optionChain для конкретной даты экспирации (unix timestamp).
+        Выбрать ближайшую дату экспирации >= t0 (по умолчанию — сейчас).
         """
-        params = {"date": str(int(expiration_unix))}
-        paths = [
-            f"/api/yahoo/op/option/{symbol}",
-            f"/api/yahoo/options/{symbol}",
-            f"/api/yahoo/finance/options/{symbol}",
-        ]
-        payload = self._try_paths(paths, params=params)
-        if "optionChain" in payload and "result" in payload["optionChain"]:
-            return payload["optionChain"]["result"][0]
-        return payload
+        if not expirations:
+            return None
+        now = int(t0 if t0 is not None else time.time())
+        future = [e for e in expirations if int(e) >= now]
+        return int(min(future)) if future else int(max(expirations))
 
-    def get_quote(self, symbol: str) -> Dict[str, Any]:
+    def get_options_chain(self, ticker: str, expiration: Optional[int] = None) -> Dict[str, Any]:
         """
-        Возвращает «квоту» по тикеру, где можно прочитать текущую цену S.
-        Возвращаем словарь с полем 'price' (float) и raw.
+        Возвращает словарь:
+        {
+          "expiration": <unix>,
+          "calls": [...],
+          "puts": [...],
+          "expirations": [...],           # список всех дат
+          "quote": {...},                 # блок с ценой базового актива и временем снимка
+          "raw": <исходный payload>       # для полного дебага
+        }
         """
-        # несколько вариантов путей для quote
-        q_paths = [
-            f"/api/yahoo/qu/quote/{symbol}",
-            f"/api/yahoo/qs/quote",              # ?symbols=SPY
-            f"/api/yahoo/market/quotes/{symbol}",
-        ]
+        params: Dict[str, Any] = {"ticker": ticker}
+        if expiration is not None:
+            params["expiration"] = int(expiration)
 
-        # сначала варианты без params
-        for p in [q_paths[0], q_paths[2]]:
-            try:
-                raw = self._try_paths([p])
-                price = _extract_price_from_quote(raw)
-                return {"price": price, "raw": raw}
-            except Exception:
-                pass
+        payload = self._get(params)
 
-        # затем вариант с параметром symbols
+        # Цена базового актива и время снимка
+        quote = payload.get("quote") or {}
+        # Список всех доступных экспираций
+        expirations = payload.get("expirationDates") or []
+
+        # ВАЖНО: у провайдера ключ именно 'chains[0]'
+        chain_node = payload.get("chains[0]") or {}
+        # Если разработчик случайно будет ожидать массив 'chains', попробуем graceful-fallback
+        if not chain_node and isinstance(payload.get("chains"), list) and payload["chains"]:
+            chain_node = payload["chains"][0]
+
+        calls = chain_node.get("calls") or []
+        puts = chain_node.get("puts") or []
+        exp = chain_node.get("expiration") or payload.get("expiration")
+
+        return {
+            "expiration": int(exp) if exp is not None else None,
+            "calls": calls,
+            "puts": puts,
+            "expirations": expirations,
+            "quote": quote,
+            "raw": payload,
+        }
+
+    # ---------- Утилиты (можешь вызывать из streamlit_app, если удобно) ----------
+
+    @staticmethod
+    def quote_price_and_time(quote: Dict[str, Any]) -> Tuple[Optional[float], Optional[int]]:
+        """
+        Достаёт S и t0 из блока quote.
+        """
+        s = quote.get("regularMarketPrice")
+        t0 = quote.get("regularMarketTime")
         try:
-            raw = self._try_paths([q_paths[1]], params={"symbols": symbol})
-            price = _extract_price_from_quote(raw)
-            return {"price": price, "raw": raw}
+            s = float(s) if s is not None else None
         except Exception:
-            # отдаём хоть что-то для дебага
-            raise
+            s = None
+        try:
+            t0 = int(t0) if t0 is not None else None
+        except Exception:
+            t0 = None
+        return s, t0
 
+    @staticmethod
+    def aggregate_by_strike(
+        calls: List[Dict[str, Any]],
+        puts: List[Dict[str, Any]]
+    ) -> Dict[float, Dict[str, Any]]:
+        """
+        Агрегирует по страйку:
+          strike -> {call_oi, put_oi, call_vol, put_vol, iv_mid}
+        Отсутствующие volume у провайдера считаем 0.
+        IV усредняем между call/put, если есть обе.
+        """
+        acc: Dict[float, Dict[str, Any]] = {}
 
-# ----------------------------- helpers (module) ------------------------------
+        def upd(strike: float, kind: str, item: Dict[str, Any]) -> None:
+            node = acc.setdefault(
+                strike,
+                {"call_oi": 0, "put_oi": 0, "call_vol": 0, "put_vol": 0, "iv_mid": None, "iv_c": None, "iv_p": None},
+            )
+            if kind == "call":
+                node["call_oi"] += int(item.get("openInterest") or 0)
+                node["call_vol"] += int(item.get("volume") or 0)
+                iv = item.get("impliedVolatility")
+                if iv is not None:
+                    node["iv_c"] = float(iv)
+            else:
+                node["put_oi"] += int(item.get("openInterest") or 0)
+                node["put_vol"] += int(item.get("volume") or 0)
+                iv = item.get("impliedVolatility")
+                if iv is not None:
+                    node["iv_p"] = float(iv)
 
-def _extract_price_from_quote(raw: Dict[str, Any]) -> float:
-    """
-    Пытаемся достать цену из разных возможных форматов Yahoo.
-    """
-    # вариант quoteResponse.result[0].regularMarketPrice
-    try:
-        return float(raw["quoteResponse"]["result"][0]["regularMarketPrice"])
-    except Exception:
-        pass
+        for it in calls or []:
+            try:
+                strike = float(it.get("strike"))
+            except Exception:
+                continue
+            upd(strike, "call", it)
 
-    # вариант price.regularMarketPrice.raw
-    try:
-        return float(raw["price"]["regularMarketPrice"]["raw"])
-    except Exception:
-        pass
+        for it in puts or []:
+            try:
+                strike = float(it.get("strike"))
+            except Exception:
+                continue
+            upd(strike, "put", it)
 
-    # вариант просто regularMarketPrice в корне
-    try:
-        return float(raw["regularMarketPrice"])
-    except Exception as e:
-        log.exception("Не удалось извлечь цену из quote payload: %s", e)
-        raise
+        # посчитаем iv_mid
+        for strike, node in acc.items():
+            iv_c = node.pop("iv_c", None)
+            iv_p = node.pop("iv_p", None)
+            if iv_c is not None and iv_p is not None:
+                node["iv_mid"] = (iv_c + iv_p) / 2.0
+            elif iv_c is not None:
+                node["iv_mid"] = iv_c
+            elif iv_p is not None:
+                node["iv_mid"] = iv_p
+            else:
+                node["iv_mid"] = None
+
+        return acc
