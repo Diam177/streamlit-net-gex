@@ -111,7 +111,8 @@ if st.button("Рассчитать", type="primary"):
         df_gex = result["table"]
 
         
-        # --- Classic k calibration (optional, aligns scale to Black–Scholes gamma*S*100) ---
+        
+        # --- Classic k calibration (unconditional) ---
         S = float(spot)
         T_years = max((int(expiry_ts) - int(snapshot_ts)) / 31536000.0, 1e-6)
 
@@ -123,7 +124,6 @@ if st.button("Рассчитать", type="primary"):
             pass
         iv_ser = iv_ser.clip(0.01, 3.0)
 
-        # Build gamma*S*100 on aligned strikes (ATM-kernel: 21 closest to spot)
         df_align = df_raw.merge(df_gex[["strike", "NetGEX"]], on="strike", how="inner").copy()
         df_align["_dist"] = (pd.to_numeric(df_align["strike"], errors="coerce") - S).abs()
         df_align = df_align.sort_values("_dist").head(21)
@@ -154,51 +154,30 @@ if st.button("Рассчитать", type="primary"):
         ]
         gS = np.asarray(gamma_vals, dtype=float) * S * 100.0
 
-        delta_oi = (
-            pd.to_numeric(df_align["call_OI"], errors="coerce").fillna(0).to_numpy()
-            - pd.to_numeric(df_align["put_OI"], errors="coerce").fillna(0).to_numpy()
-        )
-        netgex_series = pd.to_numeric(df_align["NetGEX"], errors="coerce").to_numpy()
+        finite_gS = np.isfinite(gS)
+        if finite_gS.any():
+            k_classic = float(np.median(gS[finite_gS]))
+        else:
+            # very defensive fallback
+            k_classic = float(S * 100.0 / (S * max(iv_ser.median(skipna=True), 0.3) * math.sqrt(max(T_years, 1e-6)) * math.sqrt(2 * math.pi)))
 
-        valid = (np.abs(delta_oi) > 0) & np.isfinite(netgex_series) & np.isfinite(gS)
-        if valid.any():
-            k_current = float(np.median(np.abs(netgex_series[valid]) / (np.abs(delta_oi[valid]) + 1e-12)))
-            # Underflow guard: if provider scale is extremely tiny
-            if not np.isfinite(k_current) or k_current <= 1e-12:
-                k_current = 1e-12
-            k_classic = float(np.median(gS[valid]))
-            if k_current > 0 and np.isfinite(k_current) and np.isfinite(k_classic) and k_classic > 0:
-                scale = k_classic / k_current
-                # Use constant classic k applied to ΔOI to avoid underflow of provider NetGEX
-            try:
-                oi_col = "ΔOI" if "ΔOI" in df_gex.columns else ("dOI" if "dOI" in df_gex.columns else None)
-                if oi_col is not None:
-                    df_gex["NetGEX"] = pd.to_numeric(df_gex[oi_col], errors="coerce") * k_classic
-                else:
-                    # fallback: recompute ΔOI from raw and map by strike
-                    dmap = (
-                        pd.to_numeric(df_raw["call_OI"], errors="coerce").fillna(0)
-                        - pd.to_numeric(df_raw["put_OI"], errors="coerce").fillna(0)
-                    )
-                    if "strike" in df_raw.columns:
-                        tmp = pd.DataFrame({"strike": df_raw["strike"], "_d": dmap})
-                        df_gex = df_gex.merge(tmp, on="strike", how="left")
-                        df_gex["NetGEX"] = pd.to_numeric(df_gex["_d"], errors="coerce") * k_classic
-                        df_gex.drop(columns=["_d"], inplace=True, errors="ignore")
-            except Exception as _ex:
-                logger.warning(f"Classic-k override failed: {_ex}")
+        # ΔOI from df_gex or df_raw
+        if {"call_OI","put_OI"}.issubset(df_gex.columns):
+            dseries = pd.to_numeric(df_gex["call_OI"], errors="coerce").fillna(0) - pd.to_numeric(df_gex["put_OI"], errors="coerce").fillna(0)
+        elif {"call_OI","put_OI"}.issubset(df_raw.columns):
+            tmp = pd.DataFrame({
+                "strike": df_raw["strike"],
+                "_d": pd.to_numeric(df_raw["call_OI"], errors="coerce").fillna(0) - pd.to_numeric(df_raw["put_OI"], errors="coerce").fillna(0)
+            })
+            df_gex = df_gex.merge(tmp, on="strike", how="left")
+            dseries = pd.to_numeric(df_gex["_d"], errors="coerce").fillna(0)
+            df_gex.drop(columns=["_d"], inplace=True, errors="ignore")
+        else:
+            dseries = pd.Series(0.0, index=df_gex.index)
+
+        df_gex["NetGEX"] = pd.to_numeric(dseries, errors="coerce").fillna(0).astype(float) * float(k_classic)
         # --- end calibration ---
-
-
-
-
-        st.subheader("Net GEX по страйкам")
-
-        st.dataframe(df_gex, use_container_width=True)
-
-
-
-        df_out = df_raw.merge(df_gex[["strike", "NetGEX"]], on="strike", how="left")  # uses scaled NetGEX
+df_out = df_raw.merge(df_gex[["strike", "NetGEX"]], on="strike", how="left")  # uses scaled NetGEX
 
         df_out = df_out[["strike", "call_OI", "put_OI", "call_volume", "put_volume", "iv", "NetGEX"]]
 
