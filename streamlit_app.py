@@ -51,6 +51,62 @@ def _format_date(ts: int) -> str:
     except Exception:
         return str(ts)
 
+
+# ---------- robust extractors for multiple provider shapes ----------
+
+def _get_first(d: dict, keys):
+    for k in keys:
+        v = d.get(k) if isinstance(d, dict) else None
+        if v is not None:
+            return v
+    return None
+
+def _extract_root(chain_obj: Any) -> Dict[str, Any]:
+    """
+    Support responses like:
+    - {"body":{"result":[{...}]}}          (RapidAPI /op/option/*)
+    - {"optionChain":{"result":[{...}]}}   (Yahoo query2 v7)
+    - {"result":[{...}]}                   (some mirrors)
+    - direct dict with "options"/"quote"
+    - list-wrapped variants
+    """
+    if isinstance(chain_obj, dict):
+        body = chain_obj.get("body")
+        if isinstance(body, dict):
+            res = body.get("result")
+            if isinstance(res, list) and res:
+                return res[0]
+        oc = chain_obj.get("optionChain")
+        if isinstance(oc, dict):
+            res = oc.get("result")
+            if isinstance(res, list) and res:
+                return res[0]
+        res = chain_obj.get("result")
+        if isinstance(res, list) and res:
+            return res[0]
+        # as-is
+        return chain_obj
+    if isinstance(chain_obj, list):
+        for item in chain_obj:
+            if isinstance(item, dict):
+                # try unwrap this dict
+                return _extract_root(item)
+        return {}
+    return {}
+
+def _extract_meta(chain_obj: Any) -> Dict[str, Any]:
+    """
+    Return tuple: (root, quote, expirations, options_blocks)
+    """
+    root = _extract_root(chain_obj) or {}
+    # quote heuristic
+    quote = _get_first(root, ["quote"]) or             _get_first(chain_obj if isinstance(chain_obj, dict) else {}, ["quote"]) or             _get_first(_get_first(chain_obj if isinstance(chain_obj, dict) else {}, ["meta"]) or {}, ["quote"]) or {}
+    # expirations
+    expirations = root.get("expirationDates") or root.get("expirations") or []
+    # options
+    options_blocks = root.get("options") or []
+    return root, quote, expirations, options_blocks
+
 # ---------- UI controls ----------
 
 col1, col2, col3 = st.columns([1,1,1.2])
@@ -70,7 +126,8 @@ if ticker:
         st.stop()
 
 # Универсальный парс разных провайдеров
-def _extract_first_block(chain_obj: Any) -> Dict[str, Any]:
+def _extract_first_block(chain_obj: Any) -> Dict[str, Any]:  # legacy (kept for backward compat)
+
     # ожидаем либо список с элементами, либо словарь
     if isinstance(chain_obj, list):
         for item in chain_obj:
@@ -80,13 +137,14 @@ def _extract_first_block(chain_obj: Any) -> Dict[str, Any]:
         return chain_obj
     return {}
 
-res0 = _extract_first_block(chain) or {}
-quote = res0.get("quote", {}) or res0.get("meta", {}).get("quote", {}) or {}
+root, quote, expirations, _legacy_options = _extract_meta(chain)
+res0 = root
+quote = quote or {}
 spot = _as_float(quote.get("regularMarketPrice", quote.get("price", None)), default=np.nan)
 snapshot_ts = _to_ts(quote.get("regularMarketTime", quote.get("timestamp", time.time())))
 
 # expirations
-expirations = res0.get("expirationDates") or res0.get("expirations") or []
+expirations = expirations or []
 expirations = [ _to_ts(x) for x in expirations if _to_ts(x) > 0 ]
 expirations = sorted(set(expirations))
 
@@ -108,7 +166,7 @@ run = st.button("Рассчитать уровни")
 if run:
     try:
         # --- достаём calls/puts для выбранной экспирации ---
-        options_blocks = res0.get("options") or res0.get("body", {}).get("options") or []
+        options_blocks = (res0.get("options") or _legacy_options or [])
         if not options_blocks:
             st.error("В ответе нет блока options (calls/puts). Проверьте тариф/провайдера.")
             st.stop()
