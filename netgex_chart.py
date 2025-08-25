@@ -96,6 +96,7 @@ def render_net_gex_bar_chart(final_df: pd.DataFrame, spot_price: float, ticker: 
     fig.update_layout(
         margin=dict(l=10, r=10, t=10, b=10),
         bargap=0.1,
+        height=675,  # +50% vertical height
     )
 
     # Show all strikes on x-axis
