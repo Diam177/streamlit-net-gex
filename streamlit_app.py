@@ -1,15 +1,12 @@
 import json
 import time
 import pandas as pd
-import math
 import streamlit as st
-import numpy as np
 
 from logger import get_logger, get_log_file_path
 from services.api_client import get_option_chain
 from services.net_gex import calculate_net_gex
 from services.utils.debug import list_debug_files
-from netgex_chart import render_net_gex_bar_chart
 
 st.set_page_config(page_title="Net GEX — Streamlit", layout="wide")
 logger = get_logger("ui")
@@ -89,15 +86,7 @@ if st.button("Рассчитать", type="primary"):
         } for p in puts])
 
         df_raw = pd.merge(df_calls, df_puts, on="strike", how="outer").sort_values("strike").reset_index(drop=True)
-        if "iv" not in df_raw.columns or df_raw["iv"].isna().all():
-            df_raw["iv"] = pd.concat([df_raw["call_iv"], df_raw["put_iv"]], axis=1).mean(axis=1, skipna=True)
-        # convert percent IV to decimals if needed
-        try:
-            med_iv = float(pd.to_numeric(df_raw["iv"], errors="coerce").median(skipna=True))
-            if med_iv > 1.0:
-                df_raw["iv"] = pd.to_numeric(df_raw["iv"], errors="coerce") / 100.0
-        except Exception:
-            pass
+        df_raw["iv"] = pd.concat([df_raw["call_iv"], df_raw["put_iv"]], axis=1).mean(axis=1, skipna=True)
 
         st.subheader("Сырые данные провайдера (нормализованные)")
         st.dataframe(df_raw.fillna(0), use_container_width=True)
@@ -110,165 +99,52 @@ if st.button("Рассчитать", type="primary"):
         )
         df_gex = result["table"]
 
-        
-        
-        # --- Classic k calibration (unconditional) ---
-        S = float(spot)
-        T_years = max((int(expiry_ts) - int(snapshot_ts)) / 31536000.0, 1e-6)
+        st.subheader("Net GEX по страйкам")
+        st.dataframe(df_gex, use_container_width=True)
 
-        iv_ser = pd.to_numeric(df_raw.get("iv"), errors="coerce")
-        try:
-            if float(iv_ser.median(skipna=True)) > 1.0:
-                iv_ser = iv_ser / 100.0
-        except Exception:
-            pass
-        iv_ser = iv_ser.clip(0.01, 3.0)
+        except Exception as e:
 
-        df_align = df_raw.merge(df_gex[["strike", "NetGEX"]], on="strike", how="inner").copy()
-        df_align["_dist"] = (pd.to_numeric(df_align["strike"], errors="coerce") - S).abs()
-        df_align = df_align.sort_values("_dist").head(21)
+            logger.warning(f"Calibration step skipped: {e}")
 
-        def _phi(x: float) -> float:
-            return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
-
-        def _gamma_bs(Sval: float, K: float, Tval: float, sigma: float) -> float:
-            sigma = float(max(sigma, 1e-6))
-            Tval = float(max(Tval, 1e-6))
-            try:
-                d1 = (math.log(Sval / float(K)) + 0.5 * sigma * sigma * Tval) / (sigma * math.sqrt(Tval))
-            except Exception:
-                return 0.0
-            return _phi(d1) / (Sval * sigma * math.sqrt(Tval))
-
-        iv_ser_align = pd.to_numeric(df_align.get("iv"), errors="coerce")
-        try:
-            if float(iv_ser_align.median(skipna=True)) > 1.0:
-                iv_ser_align = iv_ser_align / 100.0
-        except Exception:
-            pass
-        iv_ser_align = iv_ser_align.clip(0.01, 3.0)
-
-        gamma_vals = [
-            _gamma_bs(S, float(K), T_years, float(sig)) if pd.notna(sig) and pd.notna(K) else 0.0
-            for K, sig in zip(df_align["strike"], iv_ser_align)
-        ]
-        gS = np.asarray(gamma_vals, dtype=float) * S * 100.0
-
-        finite_gS = np.isfinite(gS)
-        if finite_gS.any():
-            k_classic = float(np.median(gS[finite_gS]))
-        else:
-            # very defensive fallback
-            k_classic = float(S * 100.0 / (S * max(iv_ser.median(skipna=True), 0.3) * math.sqrt(max(T_years, 1e-6)) * math.sqrt(2 * math.pi)))
-
-        # ΔOI from df_gex or df_raw
-        if {"call_OI","put_OI"}.issubset(df_gex.columns):
-            dseries = pd.to_numeric(df_gex["call_OI"], errors="coerce").fillna(0) - pd.to_numeric(df_gex["put_OI"], errors="coerce").fillna(0)
-        elif {"call_OI","put_OI"}.issubset(df_raw.columns):
-            tmp = pd.DataFrame({
-                "strike": df_raw["strike"],
-                "_d": pd.to_numeric(df_raw["call_OI"], errors="coerce").fillna(0) - pd.to_numeric(df_raw["put_OI"], errors="coerce").fillna(0)
-            })
-            df_gex = df_gex.merge(tmp, on="strike", how="left")
-            dseries = pd.to_numeric(df_gex["_d"], errors="coerce").fillna(0)
-            df_gex.drop(columns=["_d"], inplace=True, errors="ignore")
-        else:
-            dseries = pd.Series(0.0, index=df_gex.index)
-
-        df_gex["NetGEX"] = pd.to_numeric(dseries, errors="coerce").fillna(0).astype(float) * float(k_classic)
-        # --- end calibration ---
-df_out = df_raw.merge(df_gex[["strike", "NetGEX"]], on="strike", how="left")  # uses scaled NetGEX
-
+        df_out = df_raw.merge(df_gex[["strike", "NetGEX"]], on="strike", how="left")
         df_out = df_out[["strike", "call_OI", "put_OI", "call_volume", "put_volume", "iv", "NetGEX"]]
-
         st.subheader("Итоговая таблица (провайдер + Net GEX)")
-
         st.dataframe(df_out.fillna(0), use_container_width=True)
 
-
-
-        st.markdown("---")
-
-        # Net GEX bar chart by strike
-
-        try:
-
-            render_net_gex_bar_chart(df_out, float(spot), ticker)
-
-        except Exception as _e:
-
-            logger.warning(f"Chart render skipped: {_e}")
-
         c1, c2, c3 = st.columns(3)
-
         with c1:
-
             st.download_button(
-
                 "Скачать итоговую таблицу (CSV)",
-
                 data=df_out.to_csv(index=False).encode("utf-8"),
-
                 file_name=f"net_gex_{ticker}_{ts2str(expiry_ts)}.csv",
-
                 mime="text/csv",
-
             )
-
         with c2:
-
             st.download_button(
-
                 "Скачать сырые данные (JSON)",
-
                 data=json.dumps(df_raw.fillna(0).to_dict(orient="records"), ensure_ascii=False, indent=2),
-
                 file_name=f"raw_{ticker}_{ts2str(expiry_ts)}.json",
-
                 mime="application/json",
-
             )
-
         with c3:
-
             files = list_debug_files()
-
             if files:
-
                 last_file = files[0]
-
                 with open(last_file, "rb") as f:
-
                     st.download_button("Скачать последний debug-файл", data=f.read(), file_name=last_file.split('/')[-1])
-
             else:
-
                 st.caption("Нет debug-файлов")
 
-
-
     except Exception as e:
-
         logger.exception("Calculation failed")
-
         st.exception(e)
 
-
-
 st.divider()
-
 st.subheader("Debug / Logs")
-
 log_path = get_log_file_path()
-
 st.caption(f"Логи: {log_path}")
-
 try:
-
     with open(log_path, "rb") as f:
-
         st.download_button("Скачать лог-файл", data=f.read(), file_name="app.log")
-
 except FileNotFoundError:
-
     st.caption("Лог-файл пока не создан")
