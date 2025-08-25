@@ -1,5 +1,10 @@
+# -*- coding: utf-8 -*-
+import math
 import json
 import time
+from typing import List, Dict, Any
+
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -7,66 +12,115 @@ from logger import get_logger, get_log_file_path
 from services.api_client import get_option_chain
 from services.net_gex import calculate_net_gex
 from services.utils.debug import list_debug_files
+from netgex_chart import render_net_gex_bar_chart
 
 st.set_page_config(page_title="Net GEX — Streamlit", layout="wide")
 logger = get_logger("ui")
 
 st.title("Net GEX calculator")
 
-col_a, col_b, col_c = st.columns([1,1,2])
-with col_a:
-    ticker = st.text_input("Тикер", "SPY").strip().upper()
-with col_b:
-    debug_mode = st.toggle("Debug mode", value=True)
-with col_c:
-    st.caption("Секреты: RAPIDAPI_HOST, RAPIDAPI_KEY (App settings → Secrets).")
+# ---------- helpers ----------
 
-def ts2str(ts: int) -> str:
-    return time.strftime("%Y-%m-%d", time.gmtime(ts))
-
-def extract_chain(raw: dict) -> dict:
-    """
-    Возвращает объект result[0] вне зависимости от того, пришёл ли 'optionChain' или 'body'.
-    """
-    if "optionChain" in raw and raw["optionChain"].get("result"):
-        return raw["optionChain"]["result"][0]
-
-    if "body" in raw and isinstance(raw["body"], list) and raw["body"]:
-        return raw["body"][0]
-
-    # Если формат неизвестен — пробрасываем исключение для видимой ошибки + дебага
-    raise KeyError("Unsupported response format: neither 'optionChain' nor 'body'")
-
-# 1) общий снимок (для списка дат и S)
-try:
-    raw_initial = get_option_chain(ticker)
-    res0 = extract_chain(raw_initial)
-    expirations = res0.get("expirationDates", []) or []
-    quote = res0.get("quote", {}) or {}
-    snapshot_ts = int(quote.get("regularMarketTime") or quote.get("regularMarketTime", 0))
-    spot = float(quote.get("regularMarketPrice"))
-except Exception as e:
-    st.error(f"Ошибка загрузки данных по {ticker}: {e}")
-    st.stop()
-
-if not expirations:
-    st.error("Провайдер вернул пустой список дат экспирации.")
-    st.stop()
-
-expiry_ts = st.selectbox("Дата экспирации", options=expirations, index=0, format_func=ts2str)
-st.write(f"Spot S = {spot} | Snapshot = {ts2str(snapshot_ts)} UTC")
-
-if st.button("Рассчитать", type="primary"):
+def _to_ts(x: Any) -> int:
     try:
-        # 2) конкретная экспирация — библиотека отдаст уже нормализованный ответ
-        raw = get_option_chain(ticker, expiry_ts=int(expiry_ts))
-        res = extract_chain(raw)
+        return int(x)
+    except Exception:
+        return 0
 
-        options_blocks = res.get("options", [])
+def _as_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+def _phi(x: float) -> float:
+    return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+def _gamma_bs(S: float, K: float, T: float, sigma: float) -> float:
+    sigma = float(max(sigma, 1e-6))
+    T = float(max(T, 1e-6))
+    try:
+        d1 = (math.log(S / float(K)) + 0.5 * sigma * sigma * T) / (sigma * math.sqrt(T))
+    except Exception:
+        return 0.0
+    return _phi(d1) / (S * sigma * math.sqrt(T))  # одинаково для call/put
+
+def _format_date(ts: int) -> str:
+    try:
+        return time.strftime("%Y-%m-%d", time.gmtime(int(ts)))
+    except Exception:
+        return str(ts)
+
+# ---------- UI controls ----------
+
+col1, col2, col3 = st.columns([1,1,1.2])
+with col1:
+    ticker = st.text_input("Тикер", value="SPY").strip().upper()
+
+# Загружаем опционную цепочку
+chain = None
+quote = {}
+expirations = []
+
+if ticker:
+    try:
+        chain = get_option_chain(ticker)
+    except Exception as e:
+        st.error(f"Ошибка получения цепочки: {e}")
+        st.stop()
+
+# Универсальный парс разных провайдеров
+def _extract_first_block(chain_obj: Any) -> Dict[str, Any]:
+    # ожидаем либо список с элементами, либо словарь
+    if isinstance(chain_obj, list):
+        for item in chain_obj:
+            if isinstance(item, dict) and ("options" in item or "optionChain" in item):
+                return item
+    elif isinstance(chain_obj, dict):
+        return chain_obj
+    return {}
+
+res0 = _extract_first_block(chain) or {}
+quote = res0.get("quote", {}) or res0.get("meta", {}).get("quote", {}) or {}
+spot = _as_float(quote.get("regularMarketPrice", quote.get("price", None)), default=np.nan)
+snapshot_ts = _to_ts(quote.get("regularMarketTime", quote.get("timestamp", time.time())))
+
+# expirations
+expirations = res0.get("expirationDates") or res0.get("expirations") or []
+expirations = [ _to_ts(x) for x in expirations if _to_ts(x) > 0 ]
+expirations = sorted(set(expirations))
+
+with col2:
+    if expirations:
+        labels = [f"{_format_date(ts)} ({ts})" for ts in expirations]
+        idx = st.selectbox("Экспирация", options=list(range(len(expirations))), format_func=lambda i: labels[i])
+        expiry_ts = expirations[idx]
+    else:
+        st.warning("Нет доступных дат экспирации")
+        expiry_ts = 0
+
+with col3:
+    st.caption(f"Spot: {spot if np.isfinite(spot) else 'n/a'} | Snapshot: {_format_date(snapshot_ts)}")
+
+# Кнопка расчёта
+run = st.button("Рассчитать уровни")
+
+if run:
+    try:
+        # --- достаём calls/puts для выбранной экспирации ---
+        options_blocks = res0.get("options") or res0.get("body", {}).get("options") or []
         if not options_blocks:
             st.error("В ответе нет блока options (calls/puts). Проверьте тариф/провайдера.")
             st.stop()
-        block = options_blocks[0]
+
+        # Найдём блок с нужной датой (у Yahoo это options[{expirationDate, calls, puts}])
+        block = None
+        for b in options_blocks:
+            if _to_ts(b.get("expirationDate")) == int(expiry_ts):
+                block = b
+                break
+        if block is None:
+            block = options_blocks[0]  # как минимум что-то возьмём
 
         calls = block.get("calls", [])
         puts  = block.get("puts", [])
@@ -86,48 +140,111 @@ if st.button("Рассчитать", type="primary"):
         } for p in puts])
 
         df_raw = pd.merge(df_calls, df_puts, on="strike", how="outer").sort_values("strike").reset_index(drop=True)
-        df_raw["iv"] = pd.concat([df_raw["call_iv"], df_raw["put_iv"]], axis=1).mean(axis=1, skipna=True)
+
+        # --- IV: не перезаписываем, если уже корректно, иначе фолбэк ---
+        if "iv" not in df_raw.columns or df_raw["iv"].isna().all():
+            df_raw["iv"] = pd.concat([df_raw["call_iv"], df_raw["put_iv"]], axis=1).mean(axis=1, skipna=True)
+        # проценты -> доли, если нужно
+        try:
+            med_iv = float(pd.to_numeric(df_raw["iv"], errors="coerce").median(skipna=True))
+            if med_iv > 1.0:
+                df_raw["iv"] = pd.to_numeric(df_raw["iv"], errors="coerce") / 100.0
+        except Exception:
+            pass
 
         st.subheader("Сырые данные провайдера (нормализованные)")
         st.dataframe(df_raw.fillna(0), use_container_width=True)
 
+        # --- базовый расчёт из services.net_gex (оставляем как есть) ---
         result = calculate_net_gex(
             df=df_raw[["strike", "call_OI", "put_OI", "iv"]],
             S=float(spot),
             expiry_ts=int(expiry_ts),
             snapshot_ts=int(snapshot_ts),
         )
-        df_gex = result["table"]
+        df_gex = result.get("table", pd.DataFrame())
+        if df_gex is None or df_gex.empty:
+            df_gex = pd.DataFrame({"strike": df_raw["strike"], "NetGEX": 0.0})
 
-        st.subheader("Net GEX по страйкам")
-        st.dataframe(df_gex, use_container_width=True)
+        # --- ВАРИАНТ B: калибровка к классике и NetGEX = k_classic * ΔOI ---
+        S = float(spot) if np.isfinite(spot) else float(df_raw["strike"].median())
+        T_years = max((int(expiry_ts) - int(snapshot_ts)) / 31536000.0, 1e-6)
 
+        # выравниваем по страйкам и берём ATM-ядро (21 ближайший страйк)
+        df_align = df_raw.merge(df_gex[["strike", "NetGEX"]], on="strike", how="inner").copy()
+        df_align["strike"] = pd.to_numeric(df_align["strike"], errors="coerce")
+        df_align = df_align.dropna(subset=["strike"])
+        df_align["_dist"] = (df_align["strike"] - S).abs()
+        df_align = df_align.sort_values("_dist").head(21)
+
+        iv_align = pd.to_numeric(df_align.get("iv"), errors="coerce").clip(0.01, 3.0)
+        try:
+            if float(iv_align.median(skipna=True)) > 1.0:
+                iv_align = iv_align / 100.0
+        except Exception:
+            pass
+
+        gamma_vals = np.array([
+            _gamma_bs(S, float(K), T_years, float(sig)) if pd.notna(sig) and pd.notna(K) else 0.0
+            for K, sig in zip(df_align["strike"], iv_align)
+        ], dtype=float)
+        gS = gamma_vals * S * 100.0
+
+        finite_gS = np.isfinite(gS)
+        if finite_gS.any():
+            k_classic = float(np.median(gS[finite_gS]))
+        else:
+            # очень защитный фолбэк
+            k_classic = float(S * 100.0 / (S * max(float(iv_align.median(skipna=True)), 0.3) * math.sqrt(max(T_years, 1e-6)) * math.sqrt(2 * math.pi)))
+
+        # ΔOI по всем страйкам
+        dseries = (
+            pd.to_numeric(df_raw["call_OI"], errors="coerce").fillna(0)
+            - pd.to_numeric(df_raw["put_OI"], errors="coerce").fillna(0)
+        )
+        # переносим ΔOI на df_gex по strike
+        df_map = pd.DataFrame({"strike": df_raw["strike"], "_d": dseries})
+        df_gex = df_gex.merge(df_map, on="strike", how="left")
+        df_gex["NetGEX"] = pd.to_numeric(df_gex["_d"], errors="coerce").fillna(0).astype(float) * float(k_classic)
+        df_gex.drop(columns=["_d"], inplace=True, errors="ignore")
+
+        st.subheader("Net GEX по страйкам (Variant B, k_classic·ΔOI)")
+        st.dataframe(df_gex[["strike", "NetGEX"]].fillna(0), use_container_width=True)
+
+        # --- Итоговая таблица ---
         df_out = df_raw.merge(df_gex[["strike", "NetGEX"]], on="strike", how="left")
         df_out = df_out[["strike", "call_OI", "put_OI", "call_volume", "put_volume", "iv", "NetGEX"]]
         st.subheader("Итоговая таблица (провайдер + Net GEX)")
         st.dataframe(df_out.fillna(0), use_container_width=True)
 
+        # --- График ---
+        st.markdown("---")
+        render_net_gex_bar_chart(df_out, S, ticker)
+
+        # --- Кнопки скачивания/отладка ---
         c1, c2, c3 = st.columns(3)
         with c1:
             st.download_button(
-                "Скачать итоговую таблицу (CSV)",
+                "Скачать итог (CSV)",
                 data=df_out.to_csv(index=False).encode("utf-8"),
-                file_name=f"net_gex_{ticker}_{ts2str(expiry_ts)}.csv",
-                mime="text/csv",
+                file_name=f"{ticker}_netgex_{_format_date(snapshot_ts)}.csv",
+                mime="text/csv"
             )
         with c2:
             st.download_button(
-                "Скачать сырые данные (JSON)",
-                data=json.dumps(df_raw.fillna(0).to_dict(orient="records"), ensure_ascii=False, indent=2),
-                file_name=f"raw_{ticker}_{ts2str(expiry_ts)}.json",
-                mime="application/json",
+                "Скачать итог (JSON)",
+                data=df_out.to_json(orient="records", force_ascii=False).encode("utf-8"),
+                file_name=f"{ticker}_netgex_{_format_date(snapshot_ts)}.json",
+                mime="application/json"
             )
         with c3:
-            files = list_debug_files()
-            if files:
-                last_file = files[0]
-                with open(last_file, "rb") as f:
-                    st.download_button("Скачать последний debug-файл", data=f.read(), file_name=last_file.split('/')[-1])
+            # список debug-файлов из /tmp
+            dbg = list_debug_files()
+            if dbg:
+                st.caption("Debug-файлы:")
+                for pth in dbg:
+                    with open(pth, "rb") as f:
+                        st.download_button(f"Скачать {pth.split('/')[-1]}", data=f.read(), file_name=pth.split('/')[-1])
             else:
                 st.caption("Нет debug-файлов")
 
@@ -135,6 +252,7 @@ if st.button("Рассчитать", type="primary"):
         logger.exception("Calculation failed")
         st.exception(e)
 
+# --- Логи ---
 st.divider()
 st.subheader("Debug / Logs")
 log_path = get_log_file_path()
