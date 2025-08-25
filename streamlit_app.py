@@ -252,33 +252,44 @@ if run:
         if finite_gS.any():
             k_classic = float(np.median(gS[finite_gS]))
         else:
-            # очень защитный фолбэк
-            k_classic = float(S * 100.0 / (S * max(float(iv_align.median(skipna=True)), 0.3) * math.sqrt(max(T_years, 1e-6)) * math.sqrt(2 * math.pi)))
+            iv_med = float(iv_align.median(skipna=True)) if not iv_align.dropna().empty else 0.3
+            k_classic = float(S * 100.0 / (S * max(iv_med, 0.3) * math.sqrt(T_years) * math.sqrt(2 * math.pi)))
 
         # ΔOI по всем страйкам
+        df_raw = df_raw.copy()
+        df_gex = df_gex.copy()
+        # приводим strike к числу (важно для корректного merge)
+        df_raw["strike"] = pd.to_numeric(df_raw["strike"], errors="coerce")
+        df_gex["strike"] = pd.to_numeric(df_gex["strike"], errors="coerce")
         dseries = (
-            pd.to_numeric(df_raw["call_OI"], errors="coerce").fillna(0)
-            - pd.to_numeric(df_raw["put_OI"], errors="coerce").fillna(0)
+        pd.to_numeric(df_raw["call_OI"], errors="coerce").fillna(0)
+        - pd.to_numeric(df_raw["put_OI"], errors="coerce").fillna(0)
         )
-        # переносим ΔOI на df_gex по strike
-        df_map = pd.DataFrame({"strike": df_raw["strike"], "_d": dseries})
+        # агрегируем ΔOI по страйку и мержим по NUMERIC strike
+        df_map = (
+        pd.DataFrame({"strike": df_raw["strike"], "_d": dseries})
+        .dropna(subset=["strike"])
+        .groupby("strike", as_index=False)["_d"].sum()
+        )
+        df_gex = df_gex.dropna(subset=["strike"])
         df_gex = df_gex.merge(df_map, on="strike", how="left")
-        df_gex["NetGEX"] = pd.to_numeric(df_gex["_d"], errors="coerce").fillna(0).astype(float) * float(k_classic)
+        df_gex["_d"] = pd.to_numeric(df_gex["_d"], errors="coerce").fillna(0.0)
+        df_gex["NetGEX"] = df_gex["_d"].astype(float) * float(k_classic)
         df_gex.drop(columns=["_d"], inplace=True, errors="ignore")
-
+        
         st.subheader("Net GEX по страйкам (Variant B, k_classic·ΔOI)")
         st.dataframe(df_gex[["strike", "NetGEX"]].fillna(0), use_container_width=True)
-
+        
         # --- Итоговая таблица ---
         df_out = df_raw.merge(df_gex[["strike", "NetGEX"]], on="strike", how="left")
         df_out = df_out[["strike", "call_OI", "put_OI", "call_volume", "put_volume", "iv", "NetGEX"]]
         st.subheader("Итоговая таблица (провайдер + Net GEX)")
         st.dataframe(df_out.fillna(0), use_container_width=True)
-
+        
         # --- График ---
         st.markdown("---")
         render_net_gex_bar_chart(df_out, S, ticker)
-
+        
         # --- Кнопки скачивания/отладка ---
         c1, c2, c3 = st.columns(3)
         with c1:
