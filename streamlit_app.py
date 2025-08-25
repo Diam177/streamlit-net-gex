@@ -110,6 +110,7 @@ if st.button("Рассчитать", type="primary"):
         )
         df_gex = result["table"]
 
+        
         # --- Classic k calibration (optional, aligns scale to Black–Scholes gamma*S*100) ---
         S = float(spot)
         T_years = max((int(expiry_ts) - int(snapshot_ts)) / 31536000.0, 1e-6)
@@ -122,10 +123,15 @@ if st.button("Рассчитать", type="primary"):
             pass
         iv_ser = iv_ser.clip(0.01, 3.0)
 
-        def _phi(x):
+        # Build gamma*S*100 on aligned strikes (ATM-kernel: 21 closest to spot)
+        df_align = df_raw.merge(df_gex[["strike", "NetGEX"]], on="strike", how="inner").copy()
+        df_align["_dist"] = (pd.to_numeric(df_align["strike"], errors="coerce") - S).abs()
+        df_align = df_align.sort_values("_dist").head(21)
+
+        def _phi(x: float) -> float:
             return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
 
-        def _gamma_bs(Sval, K, Tval, sigma):
+        def _gamma_bs(Sval: float, K: float, Tval: float, sigma: float) -> float:
             sigma = float(max(sigma, 1e-6))
             Tval = float(max(Tval, 1e-6))
             try:
@@ -134,123 +140,38 @@ if st.button("Рассчитать", type="primary"):
                 return 0.0
             return _phi(d1) / (Sval * sigma * math.sqrt(Tval))
 
-                # Build gamma*S*100 on aligned strikes
-        df_align = df_raw.merge(df_gex[["strike", "NetGEX"]], on="strike", how="inner")
-# ATM kernel: take 11 strikes closest to spot to avoid underflow at far OTM
-df_align = df_align.assign(_dist=(df_align["strike"].astype(float) - float(spot)).abs()).sort_values("_dist").head(11)
-iv_ser_align = pd.to_numeric(df_align.get("iv"), errors="coerce").clip(0.01, 3.0)
-try:
-    if float(iv_ser_align.median(skipna=True)) > 1.0:
-        iv_ser_align = iv_ser_align / 100.0
-except Exception:
-    pass
-def _phi(x):
-    return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
-def _gamma_bs(Sval, K, Tval, sigma):
-    sigma = float(max(sigma, 1e-6)); Tval = float(max(Tval, 1e-6))
-    try:
-        d1 = (math.log(Sval / float(K)) + 0.5 * sigma * sigma * Tval) / (sigma * math.sqrt(Tval))
-    except Exception:
-        return 0.0
-    return _phi(d1) / (Sval * sigma * math.sqrt(Tval))
-gamma_vals = [
-    _gamma_bs(S, float(K), T_years, float(sig)) if pd.notna(sig) and pd.notna(K) else 0.0
-    for K, sig in zip(df_align["strike"], iv_ser_align)
-]
-gS = np.array(gamma_vals) * S * 100.0
-delta_oi = (
-    pd.to_numeric(df_align["call_OI"], errors="coerce").fillna(0)
-    - pd.to_numeric(df_align["put_OI"], errors="coerce").fillna(0)
-)
-netgex_series = pd.to_numeric(df_align["NetGEX"], errors="coerce")
-valid = (
-    (delta_oi != 0)
-    & netgex_series.notna()
-    & np.isfinite(netgex_series)
-    & np.isfinite(gS)
-)
-if valid.any():
-    k_current = float(np.median(np.abs(netgex_series[valid]) / (np.abs(delta_oi[valid]) + 1e-12)))
-    k_classic = float(np.median(gS[valid]))
-    if k_current > 0 and np.isfinite(k_current) and np.isfinite(k_classic) and k_classic > 0:
-        scale = k_classic / k_current
-        df_gex["NetGEX"] = pd.to_numeric(df_gex["NetGEX"], errors="coerce") * scale
-
-        iv_ser_align = pd.to_numeric(df_align.get("iv"), errors="coerce").clip(0.01, 3.0)
-
+        iv_ser_align = pd.to_numeric(df_align.get("iv"), errors="coerce")
         try:
-
             if float(iv_ser_align.median(skipna=True)) > 1.0:
-
                 iv_ser_align = iv_ser_align / 100.0
-
         except Exception:
-
             pass
-
-        def _phi(x):
-
-            return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
-
-        def _gamma_bs(Sval, K, Tval, sigma):
-
-            sigma = float(max(sigma, 1e-6)); Tval = float(max(Tval, 1e-6))
-
-            try:
-
-                d1 = (math.log(Sval / float(K)) + 0.5 * sigma * sigma * Tval) / (sigma * math.sqrt(Tval))
-
-            except Exception:
-
-                return 0.0
-
-            return _phi(d1) / (Sval * sigma * math.sqrt(Tval))
+        iv_ser_align = iv_ser_align.clip(0.01, 3.0)
 
         gamma_vals = [
-
             _gamma_bs(S, float(K), T_years, float(sig)) if pd.notna(sig) and pd.notna(K) else 0.0
-
             for K, sig in zip(df_align["strike"], iv_ser_align)
-
         ]
-
-        gS = np.array(gamma_vals) * S * 100.0
+        gS = np.asarray(gamma_vals, dtype=float) * S * 100.0
 
         delta_oi = (
-
-            pd.to_numeric(df_align["call_OI"], errors="coerce").fillna(0)
-
-            - pd.to_numeric(df_align["put_OI"], errors="coerce").fillna(0)
-
+            pd.to_numeric(df_align["call_OI"], errors="coerce").fillna(0).to_numpy()
+            - pd.to_numeric(df_align["put_OI"], errors="coerce").fillna(0).to_numpy()
         )
+        netgex_series = pd.to_numeric(df_align["NetGEX"], errors="coerce").to_numpy()
 
-        netgex_series = pd.to_numeric(df_align["NetGEX"], errors="coerce")
-
-        valid = (
-
-            (delta_oi != 0)
-
-            & netgex_series.notna()
-
-            & np.isfinite(netgex_series)
-
-            & np.isfinite(gS)
-
-        )
-
+        valid = (np.abs(delta_oi) > 0) & np.isfinite(netgex_series) & np.isfinite(gS)
         if valid.any():
-
             k_current = float(np.median(np.abs(netgex_series[valid]) / (np.abs(delta_oi[valid]) + 1e-12)))
-
+            # Underflow guard: if provider scale is extremely tiny
+            if not np.isfinite(k_current) or k_current <= 1e-12:
+                k_current = 1e-12
             k_classic = float(np.median(gS[valid]))
-
             if k_current > 0 and np.isfinite(k_current) and np.isfinite(k_classic) and k_classic > 0:
-
                 scale = k_classic / k_current
-
                 df_gex["NetGEX"] = pd.to_numeric(df_gex["NetGEX"], errors="coerce") * scale
+        # --- end calibration ---
 
-# --- end calibration ---
 
 
 
@@ -260,7 +181,7 @@ if valid.any():
 
 
 
-        df_out = df_raw.merge(df_gex[["strike", "NetGEX"]], on="strike", how="left")
+        df_out = df_raw.merge(df_gex[["strike", "NetGEX"]], on="strike", how="left")  # uses scaled NetGEX
 
         df_out = df_out[["strike", "call_OI", "put_OI", "call_volume", "put_volume", "iv", "NetGEX"]]
 
