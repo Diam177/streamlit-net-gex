@@ -1,97 +1,55 @@
-import math
-from datetime import datetime, timezone
-from typing import Any, Dict
+import numpy as np
 import pandas as pd
+from math import sqrt, pi
+from typing import Dict, Any
 
-def _norm_sigma(iv):
-    if iv is None: return None
-    try:
-        v = float(iv)
-    except Exception:
-        return None
-    if v > 1.5:
-        v /= 100.0
-    return max(v, 1e-6)
+from logger import get_logger
+from services.utils.debug import dump_json
 
-def _extract_chain(doc: Dict[str, Any]) -> Dict[str, Any]:
-    if isinstance(doc, dict) and "optionChain" in doc:
-        oc = doc["optionChain"]
-        if isinstance(oc, dict) and "result" in oc and oc["result"]:
-            return oc["result"][0]
-    if isinstance(doc, dict) and "result" in doc and isinstance(doc["result"], list) and doc["result"]:
-        return doc["result"][0]
-    return doc
+logger = get_logger("net_gex")
 
-def _collect_entry(chain_root: Dict[str, Any], target_epoch: int) -> Dict[str, Any] | None:
-    options_list = chain_root.get("options") or chain_root.get("chains") or []
-    for opt_entry in options_list or []:
-        if int(opt_entry.get("expirationDate", 0)) == int(target_epoch):
-            return opt_entry
-    if "chains[0]" in chain_root:
-        n = chain_root["chains[0]"]
-        if int(n.get("expiration", 0)) == int(target_epoch):
-            return {"expirationDate": n.get("expiration"), "calls": n.get("calls", []), "puts": n.get("puts", [])}
-    if isinstance(options_list, list) and len(options_list) == 1:
-        return options_list[0]
-    return None
+def _gamma_bs(S: float, K: float, T: float, sigma: float) -> float:
+    if sigma <= 0 or T <= 0 or S <= 0 or K <= 0:
+        return 0.0
+    d1 = (np.log(S / K) + 0.5 * sigma * sigma * T) / (sigma * sqrt(T))
+    pdf = np.exp(-0.5 * d1 * d1) / sqrt(2 * pi)
+    return float(pdf / (S * sigma * sqrt(T)))
 
-def _black_scholes_gamma(S: float, K: float, T: float, sigma: float, r: float = 0.0) -> float:
-    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0: return 0.0
-    from math import log, sqrt, exp, pi
-    d1 = (log(S/K) + (r + 0.5*sigma*sigma)*T) / (sigma*sqrt(T))
-    pdf = exp(-0.5*d1*d1) / (2*pi)**0.5
-    return pdf / (S*sigma*sqrt(T))
+def calculate_net_gex(df: pd.DataFrame, S: float, expiry_ts: int, snapshot_ts: int) -> Dict[str, Any]:
+    # Подготовка
+    df = df.copy()
+    df["call_OI"] = df["call_OI"].fillna(0).clip(lower=0)
+    df["put_OI"]  = df["put_OI"].fillna(0).clip(lower=0)
+    df["ΔOI"] = df["call_OI"] - df["put_OI"]
 
-def compute_net_gex_from_payload(payload: Dict[str, Any], expiration_epoch: int, scale_divisor: float = 1000.0, contract_multiplier: int = 100):
-    chain_root = _extract_chain(payload)
-    quote = chain_root.get("quote", {})
-    S = float(quote.get("regularMarketPrice") or quote.get("lastPrice") or quote.get("price"))
-    t0 = int(quote.get("regularMarketTime") or quote.get("tradeTime") or quote.get("time") or 0)
-    entry = _collect_entry(chain_root, expiration_epoch)
-    if entry is None:
-        raise RuntimeError("Не найден блок опционов для запрошенной экспирации.")
-    by_strike = {}
-    for side in ("calls","puts"):
-        for opt in entry.get(side, []) or []:
-            K = float(opt.get("strike"))
-            oi = int(opt.get("openInterest") or 0)
-            vol = int(opt.get("volume") or 0)
-            iv  = _norm_sigma(opt.get("impliedVolatility"))
-            rec = by_strike.setdefault(K, {"call_oi":0,"put_oi":0,"call_vol":0,"put_vol":0,"call_iv":None,"put_iv":None})
-            if side=="calls":
-                rec["call_oi"]=oi; rec["call_vol"]=vol; rec["call_iv"]=iv
-            else:
-                rec["put_oi"]=oi; rec["put_vol"]=vol; rec["put_iv"]=iv
+    T = max((expiry_ts - snapshot_ts) / 31_536_000, 1e-6)
+    iv_series = df.get("iv", pd.Series([np.nan]*len(df)))
+    iv_median = float(np.nanmedian(iv_series)) if np.isfinite(np.nanmedian(iv_series)) else 0.25
+    df["iv_used"] = iv_series.fillna(iv_median).replace(0, iv_median)
 
-    T = max((int(entry.get("expirationDate")) - t0) / 31_536_000.0, 1e-6)
-    rows = []
-    iv_list = []
-    for K, rec in sorted(by_strike.items()):
-        ivs = [v for v in (rec["call_iv"], rec["put_iv"]) if v is not None]
-        iv_avg = sum(ivs)/len(ivs) if ivs else None
-        rows.append({"Strike": float(K), "Call OI": int(rec["call_oi"]), "Put OI": int(rec["put_oi"]), "Call Volume": int(rec["call_vol"]), "Put Volume": int(rec["put_vol"]), "IV": iv_avg})
-        if iv_avg is not None: iv_list.append(iv_avg)
-    iv_median = float(pd.Series(iv_list).median()) if iv_list else 0.2
-    for r in rows:
-        if r["IV"] is None: r["IV"] = iv_median
+    # Ядро вокруг ATM
+    core = df[(df["strike"] >= S * 0.99) & (df["strike"] <= S * 1.01)]
+    if core.empty:
+        core = df.iloc[(df["strike"] - S).abs().sort_values().index[:11]]
 
-    for r in rows:
-        gamma_i = _black_scholes_gamma(S, r["Strike"], T, r["IV"])
-        r["classic_gex_i"] = gamma_i * S * contract_multiplier / scale_divisor
-        r["ΔOI"] = r["Call OI"] - r["Put OI"]
+    weights = core["call_OI"] + core["put_OI"] + 1.0
+    gammas = core.apply(lambda r: _gamma_bs(S, float(r.strike), T, float(r.iv_used)), axis=1)
+    gamma_avg = float(np.sum(gammas * weights) / np.sum(weights))
 
-    df = pd.DataFrame(rows)
-    df["w"] = (df["ΔOI"].astype(float))**2
-    if df["w"].sum() > 0:
-        k = float((df["w"] * df["classic_gex_i"]).sum() / df["w"].sum())
-    else:
-        df["dist"] = (df["Strike"] - S).abs()
-        core = df.nsmallest(11, "dist")
-        k = float((core["classic_gex_i"] * (core["ΔOI"].abs()+1)).sum() / (core["ΔOI"].abs()+1).sum())
+    # Масштаб
+    M = 100.0
+    scale_divisor = 1000.0
+    k_raw = gamma_avg * S * M / scale_divisor
 
-    df["Net GEX"] = (df["ΔOI"].astype(float) * k).round(1)
-    table_iv = df[["Strike","Call OI","Put OI","Call Volume","Put Volume","IV","Net GEX"]].sort_values("Strike").reset_index(drop=True)
-    table_basic = df[["Strike","Call OI","Put OI","Call Volume","Put Volume","Net GEX"]].sort_values("Strike").reset_index(drop=True)
+    # Итоговый Net GEX
+    df["NetGEX"] = k_raw * df["ΔOI"]
+    df_out = df[["strike", "call_OI", "put_OI", "ΔOI", "iv_used", "NetGEX"]].sort_values("strike").reset_index(drop=True)
 
-    meta = {"S": round(S,4), "T_days": round(T*365.0,4), "k": round(k,6), "contract_multiplier": contract_multiplier, "scale_divisor": scale_divisor, "expiration_epoch": int(expiration_epoch)}
-    return table_basic, table_iv, meta
+    # Debug snapshot
+    dump_json("calc_snapshot", {
+        "S": S, "T_years": T, "iv_median": iv_median,
+        "gamma_avg": gamma_avg, "k_raw": k_raw,
+        "rows": int(len(df_out))
+    })
+    logger.info(f"calc: S={S:.4f}, T={T:.6f}, iv_med={iv_median:.4f}, gamma_avg={gamma_avg:.6e}, k_raw={k_raw:.4f}, rows={len(df_out)}")
+    return {"k": k_raw, "summary": {"S": S, "T": T, "iv_median": iv_median}, "table": df_out}
