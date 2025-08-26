@@ -45,23 +45,64 @@ def extract_chain(raw: Dict[str, Any]) -> Dict[str, Any]:
         norm_opts.append({"expiration": exp, "calls": calls, "puts": puts})
     return {"S": float(S), "snapshot": snapshot, "options": norm_opts}
 
+
 def normalize_rows(calls: List[Dict[str, Any]], puts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     by_strike: Dict[float, Dict[str, Any]] = {}
-    def take_iv(x: Dict[str, Any]) -> float | None:
-        for k in ("impliedVolatility", "implied_volatility", "iv", "impliedVol"):
+
+    def get_oi(x: Dict[str, Any]) -> float:
+        # don't use truthiness; 0 is a valid OI
+        keys = ("openInterest", "open_interest", "open_interest_contracts")
+        val = None
+        for k in keys:
+            if k in x:
+                val = x[k]
+                break
+        # cautious fallback: use 'oi' only if it's clearly not an IV placeholder
+        if val is None and "oi" in x:
+            try:
+                cand = float(x["oi"])
+                if cand >= 1.0:  # plausible contracts count
+                    val = cand
+            except Exception:
+                pass
+        try:
+            return float(val) if val is not None else 0.0
+        except Exception:
+            return 0.0
+
+    def get_iv(x: Dict[str, Any]) -> float | None:
+        v = None
+        for k in ("impliedVolatility", "implied_volatility", "iv"):
             if k in x and x[k] is not None:
-                return x[k]
-        return None
+                try:
+                    vv = float(x[k])
+                except Exception:
+                    continue
+                # reject obvious OI values accidentally mapped here
+                if vv > 10.0 and vv % 1 == 0:
+                    continue
+                # normalize percent -> fraction if needed
+                if vv > 3.0:
+                    vv = vv / 100.0
+                # clamp
+                if vv <= 0.0001:
+                    continue
+                v = max(min(vv, 3.0), 0.01)
+                break
+        return v
+
     for row in calls or []:
         K = float(row.get("strike"))
         rec = by_strike.setdefault(K, {"strike": K})
-        rec["call_OI"] = float(row.get("openInterest") or row.get("oi") or 0)
-        rec["call_iv"] = take_iv(row)
+        rec["call_OI"] = get_oi(row)
+        rec["call_iv"] = get_iv(row)
+
     for row in puts or []:
         K = float(row.get("strike"))
         rec = by_strike.setdefault(K, {"strike": K})
-        rec["put_OI"] = float(row.get("openInterest") or row.get("oi") or 0)
-        rec["put_iv"] = take_iv(row)
+        rec["put_OI"] = get_oi(row)
+        rec["put_iv"] = get_iv(row)
+
     for rec in by_strike.values():
         rec.setdefault("call_OI", 0.0)
         rec.setdefault("put_OI", 0.0)
