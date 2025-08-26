@@ -1,56 +1,46 @@
+from dataclasses import dataclass
+from typing import Optional
 import numpy as np
 import pandas as pd
-from math import sqrt, pi
-from typing import Dict, Any
+from math import log, sqrt, exp
+from scipy.stats import norm
 
-from logger import get_logger
-from services.utils.debug import dump_json
+@dataclass
+class VariantBConfig:
+    iv_floor: float = 0.05          # 5% hard floor for IV used in k
+    t_days_floor: float = 1.0       # at least 1 day
+    contract_mult: float = 100.0
+    scale: float = 1.0              # additional user scale to match external site if needed
 
-logger = get_logger("net_gex")
-
-def _gamma_bs(S: float, K: float, T: float, sigma: float) -> float:
-    if sigma <= 0 or T <= 0 or S <= 0 or K <= 0:
+def _d1(S,K,vol,T):
+    if S<=0 or K<=0 or vol<=0 or T<=0:
         return 0.0
-    d1 = (np.log(S / K) + 0.5 * sigma * sigma * T) / (sigma * sqrt(T))
-    pdf = np.exp(-0.5 * d1 * d1) / sqrt(2 * pi)
-    return float(pdf / (S * sigma * sqrt(T)))
+    return (np.log(S/K) + 0.5*vol*vol*T)/(vol*np.sqrt(T))
 
-def calculate_net_gex(df: pd.DataFrame, S: float, expiry_ts: int, snapshot_ts: int) -> Dict[str, Any]:
-    # Подготовка
-    df = df.copy()
-    df["call_OI"] = df["call_OI"].fillna(0).clip(lower=0)
-    df["put_OI"]  = df["put_OI"].fillna(0).clip(lower=0)
-    df["ΔOI"] = df["call_OI"] - df["put_OI"]
+def bs_gamma(S: float, K: float, vol: float, T: float) -> float:
+    """ Black–Scholes gamma per underlying unit. """
+    if S<=0 or K<=0 or vol<=0 or T<=0:
+        return 0.0
+    d1 = (np.log(S/K) + 0.5*vol*vol*T)/(vol*np.sqrt(T))
+    return norm.pdf(d1)/(S*vol*np.sqrt(T))
 
-    T = max((expiry_ts - snapshot_ts) / 31_536_000, 1e-6)
+def compute_variant_b(df: pd.DataFrame, spot: float, days_to_exp: float, cfg: Optional[VariantBConfig]=None) -> pd.Series:
+    """Compute Net GEX per strike using Variant B: NetGEX = ΔOI * k_classic,
+    where k_classic is taken as BS gamma * S^2 * contract_mult * scale (classic choice).
+    We DO NOT normalize IVs to tiny 1e-5 – we clamp with iv_floor instead to avoid zeros.
+    """
+    cfg = cfg or VariantBConfig()
+    T = max(days_to_exp, cfg.t_days_floor)/365.0
+    vol_used = df[["iv","call_iv","put_iv"]].max(axis=1).astype(float).clip(lower=cfg.iv_floor)
 
-    iv_series = df.get("iv", pd.Series([np.nan]*len(df)))
-    iv_median = float(np.nanmedian(iv_series)) if np.isfinite(np.nanmedian(iv_series)) else 0.25
-    df["iv_used"] = iv_series.fillna(iv_median).replace(0, iv_median)
+    delta_oi = (df["call_OI"].fillna(0) - df["put_OI"].fillna(0)).astype(float)
 
-    # Ядро вокруг ATM
-    core = df[(df["strike"] >= S * 0.99) & (df["strike"] <= S * 1.01)]
-    if core.empty:
-        core = df.iloc[(df["strike"] - S).abs().sort_values().index[:11]]
+    k = []
+    for K, vol in zip(df["strike"].astype(float), vol_used):
+        g = bs_gamma(spot, K, vol, T)  # per unit
+        k_classic = g * (spot**2) * cfg.contract_mult * cfg.scale
+        k.append(k_classic)
 
-    weights = core["call_OI"] + core["put_OI"] + 1.0
-    gammas = core.apply(lambda r: _gamma_bs(S, float(r.strike), T, float(r.iv_used)), axis=1)
-    gamma_avg = float(np.sum(gammas * weights) / np.sum(weights))
-
-    # Масштаб
-    M = 100.0
-    scale_divisor = 1000.0
-    k_raw = gamma_avg * S * M / scale_divisor
-
-    # Итоговый Net GEX
-    df["NetGEX"] = k_raw * df["ΔOI"]
-    df_out = df[["strike", "call_OI", "put_OI", "ΔOI", "iv_used", "NetGEX"]].sort_values("strike").reset_index(drop=True)
-
-    dump_json("calc_snapshot", {
-        "S": S, "T_years": (expiry_ts - snapshot_ts)/31_536_000,
-        "T_used": T, "iv_median": iv_median,
-        "gamma_avg": gamma_avg, "k_raw": k_raw,
-        "rows": int(len(df_out))
-    })
-    logger.info(f"calc: S={S:.4f}, T={T:.6f}, iv_med={iv_median:.4f}, gamma_avg={gamma_avg:.6e}, k_raw={k_raw:.4f}, rows={len(df_out)}")
-    return {"k": k_raw, "summary": {"S": S, "T": T, "iv_median": iv_median}, "table": df_out}
+    k = np.array(k)
+    netgex = delta_oi.values * k
+    return pd.Series(netgex, index=df.index, name="NetGEX")
