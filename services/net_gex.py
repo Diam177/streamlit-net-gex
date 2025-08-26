@@ -21,6 +21,10 @@ def time_to_expiry(snapshot_ts: float | int, expiry_ts: float | int) -> Tuple[fl
     te = _in_seconds(expiry_ts)
     if t0 is None or te is None:
         raise ValueError("snapshot_ts and expiry_ts must be provided")
+    # Many providers give expiry at 00:00:00 UTC for the date; real option settlement is later in the day.
+    # Heuristic: if timestamp is exactly at midnight UTC, push expiry to 20:00 UTC of that date.
+    if te % 86_400 == 0:
+        te += 20 * 3600  # 20:00 UTC
     seconds = max(te - t0, 0.0)
     T_years = max(seconds / 31_536_000.0, 1e-6)  # 365d
     T_days = seconds / 86_400.0
