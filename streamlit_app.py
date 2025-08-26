@@ -120,6 +120,16 @@ raw = get_option_chain(ticker)
 dump_json("provider_raw.json", raw)
 chain = extract_chain(raw)
 
+# --- Download provider payload "as-is" (no normalization) ---
+import json
+raw_json_bytes = json.dumps(raw, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+st.download_button(
+    "Скачать данные провайдера (JSON, как есть)",
+    data=raw_json_bytes,
+    file_name=f"provider_raw_{ticker}.json",
+    mime="application/json"
+)
+
 expirations = sorted(set(blk["expiration"] for blk in chain["options"] if blk["expiration"] is not None))
 sel_exp = st.selectbox("Дата экспирации", options=expirations, index=0, format_func=lambda x: pd.to_datetime(int(x), unit="s").strftime("%Y-%m-%d"))
 
